@@ -1,9 +1,11 @@
 """
-Harris County Motivated Seller Lead Scraper v4
-Form fields confirmed from screenshot:
-- Date (From) / Date (To) — placeholder MM/DD/YYYY
-- Instrument Type — text input
-- SEARCH button
+Harris County Motivated Seller Lead Scraper v5
+Field names confirmed:
+- txtFrom = Date From  
+- txtTo = Date To
+- txtInstrument = Instrument Type
+- btnSearch = Search button
+Anti-bot: slow down, use realistic browser context
 """
 
 import asyncio
@@ -14,7 +16,6 @@ import os
 import re
 import io
 import zipfile
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -38,6 +39,12 @@ RP_URL    = f"{BASE_URL}/applications/websearch/RP.aspx"
 FRCL_URL  = f"{BASE_URL}/applications/websearch/FRCL_R.aspx"
 LOOKBACK  = int(os.environ.get("LOOKBACK_DAYS", 7))
 HEADLESS  = os.environ.get("HEADLESS", "true").lower() != "false"
+
+# Exact field names from the portal (confirmed via JS inspection)
+F_FROM       = "ctl00$ContentPlaceHolder1$txtFrom"
+F_TO         = "ctl00$ContentPlaceHolder1$txtTo"
+F_INSTRUMENT = "ctl00$ContentPlaceHolder1$txtInstrument"
+F_SEARCH     = "ctl00$ContentPlaceHolder1$btnSearch"
 
 OUTPUT_PATHS = [Path("dashboard/records.json"), Path("data/records.json")]
 GHL_CSV      = Path("data/ghl_export.csv")
@@ -107,118 +114,120 @@ class ClerkScraper:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
                 headless=HEADLESS,
-                args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ]
             )
+            # Use realistic browser context to avoid bot detection
             ctx = await browser.new_context(
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width":1280,"height":900}
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width":1366,"height":768},
+                locale="en-US",
+                timezone_id="America/Chicago",
+                extra_http_headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                }
             )
+
+            # Hide webdriver flag
+            await ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+            """)
+
             page = await ctx.new_page()
 
-            # First: get the real input field names by inspecting the page
-            await page.goto(RP_URL, timeout=60000, wait_until="domcontentloaded")
+            # Warm up the session — visit home page first
+            log.info("Warming up session...")
+            await page.goto(f"{BASE_URL}/applications/websearch/Home.aspx",
+                          timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
-            # Log ALL input field names so we know exactly what to target
-            inputs = await page.evaluate("""() => {
-                return Array.from(document.querySelectorAll('input')).map(i => ({
-                    name: i.name,
-                    id: i.id,
-                    type: i.type,
-                    placeholder: i.placeholder,
-                    value: i.value
-                }));
-            }""")
-            log.info(f"Form inputs found: {json.dumps(inputs, indent=2)}")
-
-            # Now search for each doc type
+            # Now scrape each doc type
             for code, (cat, label) in DOC_TYPES.items():
                 for attempt in range(3):
                     try:
-                        await self._search(page, code, cat, label, inputs)
+                        await self._search(page, code, cat, label)
                         break
                     except Exception as e:
                         log.warning(f"[{code}] attempt {attempt+1}: {e}")
-                        if attempt < 2: await asyncio.sleep(3)
-
-            # Foreclosure dedicated page
-            try:
-                await self._search_frcl(page)
-            except Exception as e:
-                log.warning(f"FRCL: {e}")
+                        if attempt < 2: await asyncio.sleep(5)
 
             await browser.close()
 
         log.info(f"Total: {len(self.records)} records")
         return self.records
 
-    async def _fill_field(self, page, inputs, keywords, value):
-        """Fill a field by matching input name/id/placeholder to keywords."""
-        for inp in inputs:
-            name = (inp.get("name") or "").lower()
-            iid  = (inp.get("id") or "").lower()
-            ph   = (inp.get("placeholder") or "").lower()
-            combined = f"{name} {iid} {ph}"
-            if any(kw in combined for kw in keywords):
-                selector = f"input[name='{inp['name']}']" if inp['name'] else f"input[id='{inp['id']}']"
-                try:
-                    await page.fill(selector, value, timeout=5000)
-                    log.info(f"  Filled '{inp['name'] or inp['id']}' with '{value}'")
-                    return True
-                except Exception as e:
-                    log.debug(f"  Fill failed for {selector}: {e}")
-        return False
-
-    async def _search(self, page, code, cat, label, inputs):
+    async def _search(self, page, code, cat, label):
         log.info(f"Searching: {code}")
+
+        # Navigate to RP search page
         await page.goto(RP_URL, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
         df_str = self.df.strftime("%m/%d/%Y")
         dt_str = self.dt.strftime("%m/%d/%Y")
 
-        # Fill dates using confirmed placeholder text "MM/DD/YYYY"
-        await self._fill_field(page, inputs, ["from","begin","datefrom","startdate","mm/dd/yyyy"], df_str)
-        await self._fill_field(page, inputs, ["to","end","dateto","enddate"], dt_str)
+        # Use exact field names confirmed from JS inspection
+        # Type into each field like a human (click first, then type)
+        try:
+            await page.click(f"input[name='{F_FROM}']", timeout=5000)
+            await page.fill(f"input[name='{F_FROM}']", df_str)
+            await page.wait_for_timeout(500)
+        except Exception as e:
+            log.warning(f"  Date From fill failed: {e}")
 
-        # Fill Instrument Type
-        await self._fill_field(page, inputs, ["instrument","type","instrtype","doctype"], code)
+        try:
+            await page.click(f"input[name='{F_TO}']", timeout=5000)
+            await page.fill(f"input[name='{F_TO}']", dt_str)
+            await page.wait_for_timeout(500)
+        except Exception as e:
+            log.warning(f"  Date To fill failed: {e}")
 
-        # Click SEARCH button
-        for sel in ["input[value='SEARCH']","input[value='Search']","button:has-text('SEARCH')","input[type='submit']"]:
-            try:
-                await page.click(sel, timeout=5000)
-                break
-            except: pass
+        try:
+            await page.click(f"input[name='{F_INSTRUMENT}']", timeout=5000)
+            await page.fill(f"input[name='{F_INSTRUMENT}']", code)
+            await page.wait_for_timeout(500)
+        except Exception as e:
+            log.warning(f"  Instrument fill failed: {e}")
+
+        # Log what's in the fields before submitting
+        vals = await page.evaluate(f"""() => {{
+            return {{
+                from: document.querySelector("input[name='{F_FROM}']")?.value,
+                to: document.querySelector("input[name='{F_TO}']")?.value,
+                instrument: document.querySelector("input[name='{F_INSTRUMENT}']")?.value,
+            }}
+        }}""")
+        log.info(f"  Fields before submit: {vals}")
+
+        # Click Search
+        try:
+            await page.click(f"input[name='{F_SEARCH}']", timeout=5000)
+        except:
+            await page.keyboard.press("Enter")
 
         await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_timeout(1000)
+
+        # Log page title/content snippet to see what we got back
+        title = await page.title()
+        html  = await page.content()
+        log.info(f"  Result page title: {title}")
+        log.info(f"  Page length: {len(html)} chars")
+
+        # Check for "no records" message
+        if any(x in html.lower() for x in ("no records found","no results","0 records")):
+            log.info(f"  [{code}] No records found")
+            return
+
         await self._paginate(page, code, cat, label)
-
-    async def _search_frcl(self, page):
-        log.info("Foreclosure notices page")
-        await page.goto(FRCL_URL, timeout=60000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-
-        # Get inputs for this page too
-        inputs = await page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('input')).map(i => ({
-                name: i.name, id: i.id, type: i.type, placeholder: i.placeholder
-            }));
-        }""")
-        log.info(f"FRCL inputs: {inputs}")
-
-        df_str = self.df.strftime("%m/%d/%Y")
-        dt_str = self.dt.strftime("%m/%d/%Y")
-
-        await self._fill_field(page, inputs, ["from","begin","start"], df_str)
-        await self._fill_field(page, inputs, ["to","end"], dt_str)
-
-        for sel in ["input[value='SEARCH']","input[value='Search']","input[type='submit']","button[type='submit']"]:
-            try: await page.click(sel, timeout=5000); break
-            except: pass
-
-        await page.wait_for_load_state("networkidle", timeout=30000)
-        await self._paginate(page, "NOFC", "foreclosure", "Notice of Foreclosure")
 
     async def _paginate(self, page, code, cat, label):
         pg = 1
@@ -327,7 +336,7 @@ class ParcelLookup:
                     for v in self._variants(owner): self._idx.setdefault(v,row)
                     count+=1
                 except: continue
-            log.info(f"Parcel: {count:,} records, {len(self._idx):,} keys")
+            log.info(f"Parcel: {count:,} records")
             return True
         except Exception as e: log.error(f"DBF: {e}"); return False
     def lookup(self, name):
@@ -380,7 +389,7 @@ def write_output(records, df, dt):
 
 async def main():
     now=datetime.utcnow(); dt=now; df=now-timedelta(days=LOOKBACK)
-    log.info(f"Harris County Scraper | {df.date()} → {dt.date()}")
+    log.info(f"Harris County Scraper v5 | {df.date()} → {dt.date()}")
     records=await ClerkScraper(df,dt).run()
     parcel=ParcelLookup(); loaded=parcel.load()
     for r in records:
