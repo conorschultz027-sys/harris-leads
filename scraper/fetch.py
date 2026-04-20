@@ -1,14 +1,20 @@
 """
-Harris County Motivated Seller Lead Scraper v7
-Uses requests POST with ViewState.
-Flexible parser that logs all tables found for debugging.
+Harris County Motivated Seller Lead Scraper v8
+Back to Playwright - but using EXACT confirmed field names
+and submitting via JavaScript click on the confirmed button ID.
 """
 
-import csv, json, logging, os, re, io, zipfile, time
+import asyncio, csv, json, logging, os, re, io, zipfile, time
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
 try:
     from dbfread import DBF
@@ -19,6 +25,13 @@ except ImportError:
 BASE_URL = "https://www.cclerk.hctx.net"
 RP_URL   = f"{BASE_URL}/applications/websearch/RP.aspx"
 LOOKBACK = int(os.environ.get("LOOKBACK_DAYS", 7))
+HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
+
+# CONFIRMED field names from JS inspection
+F_FROM   = "ctl00$ContentPlaceHolder1$txtFrom"
+F_TO     = "ctl00$ContentPlaceHolder1$txtTo"
+F_INST   = "ctl00$ContentPlaceHolder1$txtInstrument"
+F_BTN_ID = "ctl00_ContentPlaceHolder1_btnSearch"
 
 OUTPUT_PATHS = [Path("dashboard/records.json"), Path("data/records.json")]
 GHL_CSV      = Path("data/ghl_export.csv")
@@ -45,18 +58,10 @@ DOC_TYPES = {
     "RELLP":    ("release",      "Release Lis Pendens"),
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Connection": "keep-alive",
-    "Referer": RP_URL,
-}
-
 def compute_flags(r, now):
-    flags = []
-    cat, dt = r.get("cat",""), r.get("doc_type","")
-    owner = (r.get("owner") or "").upper()
+    flags=[]
+    cat,dt=r.get("cat",""),r.get("doc_type","")
+    owner=(r.get("owner") or "").upper()
     if dt in ("LP","RELLP") or cat=="foreclosure": flags.append("Lis pendens")
     if dt=="NOFC": flags.append("Pre-foreclosure")
     if cat=="judgment": flags.append("Judgment lien")
@@ -71,7 +76,7 @@ def compute_flags(r, now):
     return flags
 
 def compute_score(r, flags):
-    s = 30 + len(flags)*10
+    s=30+len(flags)*10
     if r.get("doc_type") in ("LP","NOFC") and r.get("cat")=="foreclosure": s+=20
     try:
         a=float(str(r.get("amount") or 0).replace(",","").replace("$",""))
@@ -84,133 +89,149 @@ def compute_score(r, flags):
 
 
 class ClerkScraper:
-    def __init__(self, date_from, date_to):
-        self.df = date_from; self.dt = date_to; self.records = []
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+    def __init__(self, df, dt):
+        self.df=df; self.dt=dt; self.records=[]
 
-    def run(self):
-        log.info("Loading RP page to get ViewState...")
-        resp = self.session.get(RP_URL, timeout=30)
-        soup = BeautifulSoup(resp.text, "lxml")
-        base_data = {i["name"]: i.get("value","") for i in soup.find_all("input") if i.get("name")}
-        log.info(f"Hidden fields: {[k for k in base_data if 'VIEW' in k.upper() or 'EVENT' in k.upper()]}")
+    async def run(self):
+        if not PLAYWRIGHT_AVAILABLE: return []
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=HEADLESS,
+                args=["--no-sandbox","--disable-setuid-sandbox",
+                      "--disable-blink-features=AutomationControlled"]
+            )
+            ctx = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width":1366,"height":768},
+                locale="en-US",
+                timezone_id="America/Chicago",
+            )
+            await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+            page = await ctx.new_page()
+
+            # Warm up
+            await page.goto(f"{BASE_URL}/applications/websearch/Home.aspx",
+                           timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+
+            for code,(cat,label) in DOC_TYPES.items():
+                for attempt in range(3):
+                    try:
+                        await self._search(page, code, cat, label)
+                        break
+                    except Exception as e:
+                        log.warning(f"[{code}] attempt {attempt+1}: {e}")
+                        if attempt<2: await asyncio.sleep(3)
+
+            await browser.close()
+        log.info(f"Total: {len(self.records)}")
+        return self.records
+
+    async def _search(self, page, code, cat, label):
+        log.info(f"Searching: {code}")
+        await page.goto(RP_URL, timeout=60000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
 
         df_str = self.df.strftime("%m/%d/%Y")
         dt_str = self.dt.strftime("%m/%d/%Y")
 
-        for code, (cat, label) in DOC_TYPES.items():
-            try:
-                self._search(base_data.copy(), code, cat, label, df_str, dt_str)
-            except Exception as e:
-                log.warning(f"[{code}]: {e}")
+        # Fill using exact name attributes
+        await page.evaluate(f"""() => {{
+            document.querySelector("input[name='{F_FROM}']").value = '{df_str}';
+            document.querySelector("input[name='{F_TO}']").value = '{dt_str}';
+            document.querySelector("input[name='{F_INST}']").value = '{code}';
+        }}""")
 
-        log.info(f"Total: {len(self.records)}")
-        return self.records
+        # Verify fields filled
+        vals = await page.evaluate(f"""() => ({{
+            from: document.querySelector("input[name='{F_FROM}']")?.value,
+            to:   document.querySelector("input[name='{F_TO}']")?.value,
+            inst: document.querySelector("input[name='{F_INST}']")?.value,
+        }})""")
+        log.info(f"  Fields: {vals}")
 
-    def _search(self, data, code, cat, label, df_str, dt_str):
-        log.info(f"Searching: {code}")
-        data.update({
-            "ctl00$ContentPlaceHolder1$txtFrom":       df_str,
-            "ctl00$ContentPlaceHolder1$txtTo":         dt_str,
-            "ctl00$ContentPlaceHolder1$txtInstrument": code,
-            "ctl00$ContentPlaceHolder1$txtFileNo":     "",
-            "ctl00$ContentPlaceHolder1$txtFilmCd":     "",
-            "ctl00$ContentPlaceHolder1$txtOR":         "",
-            "ctl00$ContentPlaceHolder1$txtEE":         "",
-            "ctl00$ContentPlaceHolder1$txtNameTee":    "",
-            "ctl00$ContentPlaceHolder1$txtDesc":       "",
-            "ctl00$ContentPlaceHolder1$btnSearch":     "Search",
-        })
-        resp = self.session.post(RP_URL, data=data, timeout=30)
-        soup = BeautifulSoup(resp.text, "lxml")
+        # Click button by ID using JavaScript
+        clicked = await page.evaluate(f"""() => {{
+            const btn = document.getElementById('{F_BTN_ID}');
+            if (btn) {{ btn.click(); return true; }}
+            return false;
+        }}""")
+        log.info(f"  Button clicked via JS: {clicked}")
 
-        # DEBUG: log all tables found and their headers
+        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_timeout(2000)
+
+        html = await page.content()
+        log.info(f"  Response: {len(html)} chars")
+
+        # Log tables for debugging
+        soup = BeautifulSoup(html, "lxml")
         tables = soup.find_all("table")
-        log.info(f"  [{code}] {len(resp.text)} chars, {len(tables)} tables found")
-        for i, tbl in enumerate(tables):
-            rows = tbl.find_all("tr")
+        log.info(f"  Tables found: {len(tables)}")
+        for i,tbl in enumerate(tables[:5]):
+            rows=tbl.find_all("tr")
             if rows:
-                hdrs = [td.get_text(" ", strip=True) for td in rows[0].find_all(["th","td"])]
-                if hdrs and any(hdrs):
-                    log.info(f"    Table {i}: {len(rows)} rows, headers: {hdrs[:6]}")
+                hdrs=[td.get_text(" ",strip=True) for td in rows[0].find_all(["th","td"])]
+                if any(hdrs): log.info(f"    Table {i} ({len(rows)} rows): {hdrs[:8]}")
 
         recs = self._parse(soup, code, cat, label)
         self.records.extend(recs)
         log.info(f"  [{code}] page 1: {len(recs)} records")
 
         # Pagination
-        pg = 1
-        while pg < 50:
-            next_link = None
-            for a in soup.find_all("a"):
-                txt = a.get_text(strip=True)
-                if txt in ("Next", ">", "Next >") or "Next" in txt:
-                    next_link = a; break
-            if not next_link: break
-            href = next_link.get("href","")
-            m = re.search(r"__doPostBack\('([^']+)','([^']*)'\)", href)
-            if not m: break
-            data["__EVENTTARGET"] = m.group(1)
-            data["__EVENTARGUMENT"] = m.group(2)
-            data.pop("ctl00$ContentPlaceHolder1$btnSearch", None)
-            resp = self.session.post(RP_URL, data=data, timeout=30)
-            soup = BeautifulSoup(resp.text, "lxml")
-            recs = self._parse(soup, code, cat, label)
-            self.records.extend(recs)
-            pg += 1
-            log.info(f"  [{code}] page {pg}: {len(recs)} records")
-            if not recs: break
+        pg=1
+        while pg<50:
+            try:
+                nxt=page.locator("a:has-text('Next'), input[value='Next >']").first
+                if await nxt.count()==0: break
+                await nxt.click()
+                await page.wait_for_load_state("networkidle",timeout=20000)
+                html=await page.content()
+                soup=BeautifulSoup(html,"lxml")
+                recs=self._parse(soup,code,cat,label)
+                self.records.extend(recs)
+                pg+=1
+                log.info(f"  [{code}] page {pg}: {len(recs)} records")
+                if not recs: break
+            except: break
 
     def _parse(self, soup, code, cat, label):
-        recs = []
+        recs=[]
         for tbl in soup.find_all("table"):
-            rows = tbl.find_all("tr")
-            if len(rows) < 2: continue
-            hdrs = [th.get_text(" ", strip=True).lower() for th in rows[0].find_all(["th","td"])]
-            joined = " ".join(hdrs)
-
-            # Very permissive check — any table with date/name/number columns
-            if not any(k in joined for k in (
-                "doc","filed","grantor","instrument","grantee",
-                "file","date","name","number","type","record"
-            )): continue
-
-            if len(hdrs) < 3: continue
-
-            col = {}
+            rows=tbl.find_all("tr")
+            if len(rows)<2: continue
+            hdrs=[th.get_text(" ",strip=True).lower() for th in rows[0].find_all(["th","td"])]
+            joined=" ".join(hdrs)
+            if not any(k in joined for k in ("doc","filed","grantor","instrument","grantee","file no","or name","ee name")): continue
+            if len(hdrs)<3: continue
+            col={}
             for i,h in enumerate(hdrs):
-                hl = h.lower()
-                if any(x in hl for x in ("file no","doc no","doc num","instrument no","film","number")): col.setdefault("doc_num",i)
-                elif any(x in hl for x in ("filed","record date","date filed","date")): col.setdefault("filed",i)
-                elif any(x in hl for x in ("grantor","or name","name or","debtor","seller","plaintiff")): col.setdefault("grantor",i)
-                elif any(x in hl for x in ("grantee","ee name","name ee","creditor","buyer","defendant")): col.setdefault("grantee",i)
+                hl=h.lower()
+                if any(x in hl for x in ("file no","doc no","doc num","instrument","film","number")): col.setdefault("doc_num",i)
+                elif any(x in hl for x in ("filed","record date","date")): col.setdefault("filed",i)
+                elif any(x in hl for x in ("grantor","or name","debtor","seller")): col.setdefault("grantor",i)
+                elif any(x in hl for x in ("grantee","ee name","creditor","buyer")): col.setdefault("grantee",i)
                 elif any(x in hl for x in ("legal","description","subdiv")): col.setdefault("legal",i)
-                elif any(x in hl for x in ("amount","consid","balance")): col.setdefault("amount",i)
-                elif "type" in hl: col.setdefault("doc_type_col",i)
-
-            # Must have at least doc_num or filed
-            if not col or ("doc_num" not in col and "filed" not in col):
-                continue
-
+                elif any(x in hl for x in ("amount","consid")): col.setdefault("amount",i)
+            if "doc_num" not in col and "filed" not in col: continue
             for row in rows[1:]:
-                cells = row.find_all("td")
-                if not cells or len(cells) < 2: continue
+                cells=row.find_all("td")
+                if not cells: continue
                 try:
                     def t(k):
                         i=col.get(k)
                         return cells[i].get_text(" ",strip=True) if i is not None and i<len(cells) else ""
-                    doc_num = t("doc_num") or t("doc_type_col")
-                    if not doc_num or len(doc_num) < 2: continue
-                    url = ""
+                    doc_num=t("doc_num")
+                    if not doc_num or len(doc_num)<2: continue
+                    url=""
                     for cell in cells:
-                        a = cell.find("a", href=True)
+                        a=cell.find("a",href=True)
                         if a:
-                            href = a["href"]
-                            url = href if href.startswith("http") else BASE_URL+"/"+href.lstrip("/")
+                            href=a["href"]
+                            url=href if href.startswith("http") else BASE_URL+"/"+href.lstrip("/")
                             break
-                    if not url: url = f"{RP_URL}?FileNum={doc_num}"
-                    amt = None
+                    if not url: url=f"{RP_URL}?FileNum={doc_num}"
+                    amt=None
                     try:
                         raw=re.sub(r"[^\d.]","",t("amount"))
                         if raw: amt=float(raw)
@@ -316,10 +337,10 @@ def write_output(records,df,dt):
         p.write_text(json.dumps(payload,indent=2,default=str),encoding="utf-8")
         log.info(f"→ {p}")
 
-def main():
+async def main():
     now=datetime.utcnow(); dt=now; df=now-timedelta(days=LOOKBACK)
-    log.info(f"Harris County Scraper v7 | {df.date()} → {dt.date()}")
-    records=ClerkScraper(df,dt).run()
+    log.info(f"Harris County Scraper v8 | {df.date()} → {dt.date()}")
+    records=await ClerkScraper(df,dt).run()
     parcel=ParcelLookup(); loaded=parcel.load()
     for r in records:
         try:
@@ -337,4 +358,4 @@ def main():
     log.info(f"Done: {len(records)} records | {sum(1 for r in records if r.get('prop_address'))} with address")
 
 if __name__=="__main__":
-    main()
+    asyncio.run(main())
