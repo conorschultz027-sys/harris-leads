@@ -49,7 +49,7 @@ jobs:
           git add dashboard/records.json data/records.json data/ghl_export.csv || true
           git diff --cached --quiet && echo "No changes to commit" || \
             git commit -m "chore: update leads $(date -u +%Y-%m-%d)"
-          git push
+          git pull --rebase && git push
 
   deploy-pages:
     needs: scrape
