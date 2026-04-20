@@ -1,14 +1,9 @@
 """
-Harris County Motivated Seller Lead Scraper v5
-Field names confirmed:
-- txtFrom = Date From  
-- txtTo = Date To
-- txtInstrument = Instrument Type
-- btnSearch = Search button
-Anti-bot: slow down, use realistic browser context
+Harris County Motivated Seller Lead Scraper v6
+Uses requests + BeautifulSoup to handle ASP.NET ViewState properly.
+Gets ViewState from page, then POSTs form with all required fields.
 """
 
-import asyncio
 import csv
 import json
 import logging
@@ -16,6 +11,7 @@ import os
 import re
 import io
 import zipfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,28 +19,14 @@ import requests
 from bs4 import BeautifulSoup
 
 try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-
-try:
     from dbfread import DBF
     DBFREAD_AVAILABLE = True
 except ImportError:
     DBFREAD_AVAILABLE = False
 
-BASE_URL  = "https://www.cclerk.hctx.net"
-RP_URL    = f"{BASE_URL}/applications/websearch/RP.aspx"
-FRCL_URL  = f"{BASE_URL}/applications/websearch/FRCL_R.aspx"
-LOOKBACK  = int(os.environ.get("LOOKBACK_DAYS", 7))
-HEADLESS  = os.environ.get("HEADLESS", "true").lower() != "false"
-
-# Exact field names from the portal (confirmed via JS inspection)
-F_FROM       = "ctl00$ContentPlaceHolder1$txtFrom"
-F_TO         = "ctl00$ContentPlaceHolder1$txtTo"
-F_INSTRUMENT = "ctl00$ContentPlaceHolder1$txtInstrument"
-F_SEARCH     = "ctl00$ContentPlaceHolder1$btnSearch"
+BASE_URL = "https://www.cclerk.hctx.net"
+RP_URL   = f"{BASE_URL}/applications/websearch/RP.aspx"
+LOOKBACK = int(os.environ.get("LOOKBACK_DAYS", 7))
 
 OUTPUT_PATHS = [Path("dashboard/records.json"), Path("data/records.json")]
 GHL_CSV      = Path("data/ghl_export.csv")
@@ -69,6 +51,15 @@ DOC_TYPES = {
     "PRO":      ("probate",      "Probate Document"),
     "NOC":      ("construction", "Notice of Commencement"),
     "RELLP":    ("release",      "Release Lis Pendens"),
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Referer": RP_URL,
 }
 
 def compute_flags(r, now):
@@ -103,149 +94,130 @@ def compute_score(r, flags):
 
 class ClerkScraper:
     def __init__(self, date_from, date_to):
-        self.df = date_from
-        self.dt = date_to
+        self.df     = date_from
+        self.dt     = date_to
         self.records = []
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
 
-    async def run(self):
-        if not PLAYWRIGHT_AVAILABLE:
-            log.error("Playwright not available"); return []
+    def run(self):
+        # Get initial page to extract ViewState
+        log.info("Loading RP search page...")
+        for attempt in range(3):
+            try:
+                resp = self.session.get(RP_URL, timeout=30)
+                resp.raise_for_status()
+                break
+            except Exception as e:
+                log.warning(f"GET attempt {attempt+1}: {e}")
+                time.sleep(5)
+        else:
+            log.error("Could not load RP page"); return []
 
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=HEADLESS,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                ]
-            )
-            # Use realistic browser context to avoid bot detection
-            ctx = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width":1366,"height":768},
-                locale="en-US",
-                timezone_id="America/Chicago",
-                extra_http_headers={
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.5",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                }
-            )
+        soup = BeautifulSoup(resp.text, "lxml")
 
-            # Hide webdriver flag
-            await ctx.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-            """)
+        # Extract ALL hidden fields (ViewState, EventValidation, etc.)
+        base_data = {}
+        for inp in soup.find_all("input", type="hidden"):
+            name = inp.get("name","")
+            val  = inp.get("value","")
+            if name:
+                base_data[name] = val
+                if "VIEWSTATE" in name.upper():
+                    log.info(f"  Found hidden field: {name[:40]}... ({len(val)} chars)")
 
-            page = await ctx.new_page()
-
-            # Warm up the session — visit home page first
-            log.info("Warming up session...")
-            await page.goto(f"{BASE_URL}/applications/websearch/Home.aspx",
-                          timeout=60000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000)
-
-            # Now scrape each doc type
-            for code, (cat, label) in DOC_TYPES.items():
-                for attempt in range(3):
-                    try:
-                        await self._search(page, code, cat, label)
-                        break
-                    except Exception as e:
-                        log.warning(f"[{code}] attempt {attempt+1}: {e}")
-                        if attempt < 2: await asyncio.sleep(5)
-
-            await browser.close()
-
-        log.info(f"Total: {len(self.records)} records")
-        return self.records
-
-    async def _search(self, page, code, cat, label):
-        log.info(f"Searching: {code}")
-
-        # Navigate to RP search page
-        await page.goto(RP_URL, timeout=60000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
+        log.info(f"  Total hidden fields: {len(base_data)}")
 
         df_str = self.df.strftime("%m/%d/%Y")
         dt_str = self.dt.strftime("%m/%d/%Y")
 
-        # Use exact field names confirmed from JS inspection
-        # Type into each field like a human (click first, then type)
-        try:
-            await page.click(f"input[name='{F_FROM}']", timeout=5000)
-            await page.fill(f"input[name='{F_FROM}']", df_str)
-            await page.wait_for_timeout(500)
-        except Exception as e:
-            log.warning(f"  Date From fill failed: {e}")
+        # Search each doc type
+        for code, (cat, label) in DOC_TYPES.items():
+            for attempt in range(3):
+                try:
+                    self._search(base_data.copy(), code, cat, label, df_str, dt_str)
+                    break
+                except Exception as e:
+                    log.warning(f"[{code}] attempt {attempt+1}: {e}")
+                    if attempt < 2: time.sleep(5)
 
-        try:
-            await page.click(f"input[name='{F_TO}']", timeout=5000)
-            await page.fill(f"input[name='{F_TO}']", dt_str)
-            await page.wait_for_timeout(500)
-        except Exception as e:
-            log.warning(f"  Date To fill failed: {e}")
+        log.info(f"Total: {len(self.records)} records")
+        return self.records
 
-        try:
-            await page.click(f"input[name='{F_INSTRUMENT}']", timeout=5000)
-            await page.fill(f"input[name='{F_INSTRUMENT}']", code)
-            await page.wait_for_timeout(500)
-        except Exception as e:
-            log.warning(f"  Instrument fill failed: {e}")
+    def _search(self, data, code, cat, label, df_str, dt_str):
+        log.info(f"Searching: {code}")
 
-        # Log what's in the fields before submitting
-        vals = await page.evaluate(f"""() => {{
-            return {{
-                from: document.querySelector("input[name='{F_FROM}']")?.value,
-                to: document.querySelector("input[name='{F_TO}']")?.value,
-                instrument: document.querySelector("input[name='{F_INSTRUMENT}']")?.value,
-            }}
-        }}""")
-        log.info(f"  Fields before submit: {vals}")
+        # Add form fields using EXACT confirmed names
+        data.update({
+            "ctl00$ContentPlaceHolder1$txtFrom":       df_str,
+            "ctl00$ContentPlaceHolder1$txtTo":         dt_str,
+            "ctl00$ContentPlaceHolder1$txtInstrument": code,
+            "ctl00$ContentPlaceHolder1$txtFileNo":     "",
+            "ctl00$ContentPlaceHolder1$txtFilmCd":     "",
+            "ctl00$ContentPlaceHolder1$txtOR":         "",
+            "ctl00$ContentPlaceHolder1$txtEE":         "",
+            "ctl00$ContentPlaceHolder1$txtNameTee":    "",
+            "ctl00$ContentPlaceHolder1$txtDesc":       "",
+            "ctl00$ContentPlaceHolder1$txtVolNo":      "",
+            "ctl00$ContentPlaceHolder1$txtPageNo":     "",
+            "ctl00$ContentPlaceHolder1$btnSearch":     "Search",
+        })
 
-        # Click Search
-        try:
-            await page.click(f"input[name='{F_SEARCH}']", timeout=5000)
-        except:
-            await page.keyboard.press("Enter")
+        log.info(f"  POSTing: from={df_str}, to={dt_str}, instrument={code}")
 
-        await page.wait_for_load_state("networkidle", timeout=30000)
-        await page.wait_for_timeout(1000)
+        resp = self.session.post(RP_URL, data=data, timeout=30)
+        resp.raise_for_status()
 
-        # Log page title/content snippet to see what we got back
-        title = await page.title()
-        html  = await page.content()
-        log.info(f"  Result page title: {title}")
-        log.info(f"  Page length: {len(html)} chars")
+        log.info(f"  Response: {resp.status_code}, {len(resp.text)} chars")
 
-        # Check for "no records" message
-        if any(x in html.lower() for x in ("no records found","no results","0 records")):
+        # Check if we got results or the search form back
+        if "No Records Found" in resp.text or "no records" in resp.text.lower():
             log.info(f"  [{code}] No records found")
             return
 
-        await self._paginate(page, code, cat, label)
+        soup = BeautifulSoup(resp.text, "lxml")
 
-    async def _paginate(self, page, code, cat, label):
-        pg = 1
-        while pg <= 50:
-            html = await page.content()
-            recs = self._parse(html, code, cat, label)
+        # Look for results table
+        recs = self._parse(soup, code, cat, label)
+        self.records.extend(recs)
+        log.info(f"  [{code}] page 1: {len(recs)} records")
+
+        # Handle pagination via __doPostBack
+        page_num = 1
+        while page_num < 50:
+            # Look for Next page link
+            next_link = None
+            for a in soup.find_all("a", href=True):
+                if "Next" in a.get_text() or ">" in a.get_text():
+                    next_link = a
+                    break
+
+            if not next_link:
+                break
+
+            # Extract __doPostBack arguments
+            href = next_link.get("href","")
+            match = re.search(r"__doPostBack\('([^']+)','([^']*)'\)", href)
+            if not match:
+                break
+
+            data["__EVENTTARGET"]   = match.group(1)
+            data["__EVENTARGUMENT"] = match.group(2)
+            data.pop("ctl00$ContentPlaceHolder1$btnSearch", None)
+
+            resp = self.session.post(RP_URL, data=data, timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+
+            recs = self._parse(soup, code, cat, label)
             self.records.extend(recs)
-            log.info(f"  [{code}] page {pg}: {len(recs)} records")
-            try:
-                nxt = page.locator("a:has-text('Next'), input[value='Next >']").first
-                if await nxt.count() == 0: break
-                await nxt.click()
-                await page.wait_for_load_state("networkidle", timeout=20000)
-                pg += 1
-            except: break
+            page_num += 1
+            log.info(f"  [{code}] page {page_num}: {len(recs)} records")
 
-    def _parse(self, html, code, cat, label):
-        soup = BeautifulSoup(html, "lxml")
+            if not recs:
+                break
+
+    def _parse(self, soup, code, cat, label):
         recs = []
         for tbl in soup.find_all("table"):
             rows = tbl.find_all("tr")
@@ -387,10 +359,10 @@ def write_output(records, df, dt):
         p.write_text(json.dumps(payload,indent=2,default=str),encoding="utf-8")
         log.info(f"→ {p}")
 
-async def main():
+def main():
     now=datetime.utcnow(); dt=now; df=now-timedelta(days=LOOKBACK)
-    log.info(f"Harris County Scraper v5 | {df.date()} → {dt.date()}")
-    records=await ClerkScraper(df,dt).run()
+    log.info(f"Harris County Scraper v6 | {df.date()} → {dt.date()}")
+    records=ClerkScraper(df,dt).run()
     parcel=ParcelLookup(); loaded=parcel.load()
     for r in records:
         try:
@@ -408,4 +380,4 @@ async def main():
     log.info(f"Done: {len(records)} records | {sum(1 for r in records if r.get('prop_address'))} with address")
 
 if __name__=="__main__":
-    asyncio.run(main())
+    main()
