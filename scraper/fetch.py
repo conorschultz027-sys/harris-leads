@@ -3,70 +3,61 @@ Harris County Motivated Seller Lead Scraper v8
 Back to Playwright - but using EXACT confirmed field names
 and submitting via JavaScript click on the confirmed button ID.
 """
-
 import asyncio, csv, json, logging, os, re, io, zipfile, time
 from datetime import datetime, timedelta
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
-
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
-
 try:
     from dbfread import DBF
     DBFREAD_AVAILABLE = True
 except ImportError:
     DBFREAD_AVAILABLE = False
-
 BASE_URL = "https://www.cclerk.hctx.net"
 RP_URL   = f"{BASE_URL}/applications/websearch/RP.aspx"
 LOOKBACK = int(os.environ.get("LOOKBACK_DAYS", 7))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
-
 # CONFIRMED field names from JS inspection
 F_FROM   = "ctl00$ContentPlaceHolder1$txtFrom"
 F_TO     = "ctl00$ContentPlaceHolder1$txtTo"
 F_INST   = "ctl00$ContentPlaceHolder1$txtInstrument"
 F_BTN_ID = "ctl00_ContentPlaceHolder1_btnSearch"
-
 OUTPUT_PATHS = [Path("dashboard/records.json"), Path("data/records.json")]
 GHL_CSV      = Path("data/ghl_export.csv")
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
-
 DOC_TYPES = {
-    "LP":       ("foreclosure",  "Lis Pendens"),
-    "NOFC":     ("foreclosure",  "Notice of Foreclosure"),
-    "TAXDEED":  ("tax",          "Tax Deed"),
-    "JUD":      ("judgment",     "Judgment"),
-    "CCJ":      ("judgment",     "Certified Judgment"),
-    "DRJUD":    ("judgment",     "Domestic Judgment"),
-    "LNCORPTX": ("tax_lien",     "Corp Tax Lien"),
-    "LNIRS":    ("tax_lien",     "IRS Lien"),
-    "LNFED":    ("tax_lien",     "Federal Lien"),
-    "LN":       ("lien",         "Lien"),
-    "LNMECH":   ("lien",         "Mechanic Lien"),
-    "LNHOA":    ("lien",         "HOA Lien"),
-    "MEDLN":    ("lien",         "Medicaid Lien"),
-    "PRO":      ("probate",      "Probate Document"),
-    "NOC":      ("construction", "Notice of Commencement"),
-    "RELLP":    ("release",      "Release Lis Pendens"),
+    "L/P":      ("foreclosure",  "Lis Pendens"),
+    "NOTICE":   ("foreclosure",  "Notice of Foreclosure"),
+    "TRSALE":   ("tax",          "Trustee Sale"),
+    "JUDGE":    ("judgment",     "Judgment"),
+    "A/J":      ("judgment",     "Abstract of Judgment"),
+    "DEED":     ("tax",          "Tax/Sheriff Deed"),
+    "T/L":      ("tax_lien",     "Federal Tax Lien"),
+    "LIEN":     ("lien",         "Lien"),
+    "M/L":      ("lien",         "Mechanic Lien"),
+    "HOA":      ("lien",         "HOA Lien"),
+    "MED":      ("lien",         "Medicaid Lien"),
+    
+    "REL":      ("release",      "Release"),
+    "PROB":     ("probate",      "Probate Document"),
+    
+    
 }
-
 def compute_flags(r, now):
     flags=[]
     cat,dt=r.get("cat",""),r.get("doc_type","")
     owner=(r.get("owner") or "").upper()
     if dt in ("LP","RELLP") or cat=="foreclosure": flags.append("Lis pendens")
-    if dt=="NOFC": flags.append("Pre-foreclosure")
+    if dt=="NOTICE":   ("foreclosure",  "Notice of Foreclosure"),
     if cat=="judgment": flags.append("Judgment lien")
     if cat in ("tax","tax_lien"): flags.append("Tax lien")
-    if dt=="LNMECH": flags.append("Mechanic lien")
+    if dt=="MED":      ("lien",         "Medicaid Lien"),
     if cat=="probate": flags.append("Probate / estate")
     if any(k in owner for k in ("LLC","INC","CORP","LTD","LP ","L.P.","L.L.C")): flags.append("LLC / corp owner")
     try:
@@ -74,7 +65,6 @@ def compute_flags(r, now):
             flags.append("New this week")
     except: pass
     return flags
-
 def compute_score(r, flags):
     s=30+len(flags)*10
     if r.get("doc_type") in ("LP","NOFC") and r.get("cat")=="foreclosure": s+=20
@@ -86,12 +76,9 @@ def compute_score(r, flags):
     if "New this week" in flags: s+=5
     if r.get("prop_address"): s+=5
     return min(s,100)
-
-
 class ClerkScraper:
     def __init__(self, df, dt):
         self.df=df; self.dt=dt; self.records=[]
-
     async def run(self):
         if not PLAYWRIGHT_AVAILABLE: return []
         async with async_playwright() as pw:
@@ -108,12 +95,10 @@ class ClerkScraper:
             )
             await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
             page = await ctx.new_page()
-
             # Warm up
             await page.goto(f"{BASE_URL}/applications/websearch/Home.aspx",
                            timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(2000)
-
             for code,(cat,label) in DOC_TYPES.items():
                 for attempt in range(3):
                     try:
@@ -122,26 +107,21 @@ class ClerkScraper:
                     except Exception as e:
                         log.warning(f"[{code}] attempt {attempt+1}: {e}")
                         if attempt<2: await asyncio.sleep(3)
-
             await browser.close()
         log.info(f"Total: {len(self.records)}")
         return self.records
-
     async def _search(self, page, code, cat, label):
         log.info(f"Searching: {code}")
         await page.goto(RP_URL, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
-
         df_str = self.df.strftime("%m/%d/%Y")
         dt_str = self.dt.strftime("%m/%d/%Y")
-
         # Fill using exact name attributes
         await page.evaluate(f"""() => {{
             document.querySelector("input[name='{F_FROM}']").value = '{df_str}';
             document.querySelector("input[name='{F_TO}']").value = '{dt_str}';
             document.querySelector("input[name='{F_INST}']").value = '{code}';
         }}""")
-
         # Verify fields filled
         vals = await page.evaluate(f"""() => ({{
             from: document.querySelector("input[name='{F_FROM}']")?.value,
@@ -149,7 +129,6 @@ class ClerkScraper:
             inst: document.querySelector("input[name='{F_INST}']")?.value,
         }})""")
         log.info(f"  Fields: {vals}")
-
         # Click button by ID using JavaScript
         clicked = await page.evaluate(f"""() => {{
             const btn = document.getElementById('{F_BTN_ID}');
@@ -157,13 +136,10 @@ class ClerkScraper:
             return false;
         }}""")
         log.info(f"  Button clicked via JS: {clicked}")
-
         await page.wait_for_load_state("networkidle", timeout=30000)
         await page.wait_for_timeout(2000)
-
         html = await page.content()
         log.info(f"  Response: {len(html)} chars")
-
         # Log tables for debugging
         soup = BeautifulSoup(html, "lxml")
         tables = soup.find_all("table")
@@ -173,11 +149,9 @@ class ClerkScraper:
             if rows:
                 hdrs=[td.get_text(" ",strip=True) for td in rows[0].find_all(["th","td"])]
                 if any(hdrs): log.info(f"    Table {i} ({len(rows)} rows): {hdrs[:8]}")
-
         recs = self._parse(soup, code, cat, label)
         self.records.extend(recs)
         log.info(f"  [{code}] page 1: {len(recs)} records")
-
         # Pagination
         pg=1
         while pg<50:
@@ -194,7 +168,6 @@ class ClerkScraper:
                 log.info(f"  [{code}] page {pg}: {len(recs)} records")
                 if not recs: break
             except: break
-
     def _parse(self, soup, code, cat, label):
         recs=[]
         for tbl in soup.find_all("table"):
@@ -247,8 +220,6 @@ class ClerkScraper:
                         "clerk_url":url,"flags":[],"score":0})
                 except Exception as e: log.debug(f"row: {e}")
         return recs
-
-
 class ParcelLookup:
     URLS=["https://pdata.hcad.org/Pdata/download/Real_acct_owner.zip"]
     def __init__(self): self._idx={}
@@ -300,12 +271,9 @@ class ParcelLookup:
                         "mail_address":c(["ADDR_1","MAILADR1"]),"mail_city":c(["CITY","MAILCITY"]),
                         "mail_state":c(["STATE","MAILSTATE"]) or "TX","mail_zip":c(["ZIP","MAILZIP"])}
         return {}
-
-
 GHL_COLS=["First Name","Last Name","Mailing Address","Mailing City","Mailing State","Mailing Zip",
           "Property Address","Property City","Property State","Property Zip","Lead Type","Document Type",
           "Date Filed","Document Number","Amount/Debt Owed","Seller Score","Motivated Seller Flags","Source","Public Records URL"]
-
 def write_ghl(records,path):
     path.parent.mkdir(parents=True,exist_ok=True)
     with open(path,"w",newline="",encoding="utf-8") as f:
@@ -327,7 +295,6 @@ def write_ghl(records,path):
                     "Public Records URL":r.get("clerk_url","")})
             except: pass
     log.info(f"GHL CSV: {path} ({len(records)} rows)")
-
 def write_output(records,df,dt):
     payload={"fetched_at":datetime.utcnow().isoformat()+"Z","source":"Harris County Clerk",
         "date_range":{"from":df.strftime("%Y-%m-%d"),"to":dt.strftime("%Y-%m-%d")},
@@ -336,7 +303,6 @@ def write_output(records,df,dt):
         p.parent.mkdir(parents=True,exist_ok=True)
         p.write_text(json.dumps(payload,indent=2,default=str),encoding="utf-8")
         log.info(f"→ {p}")
-
 async def main():
     now=datetime.utcnow(); dt=now; df=now-timedelta(days=LOOKBACK)
     log.info(f"Harris County Scraper v8 | {df.date()} → {dt.date()}")
@@ -356,6 +322,5 @@ async def main():
     write_output(records,df,dt)
     write_ghl(records,GHL_CSV)
     log.info(f"Done: {len(records)} records | {sum(1 for r in records if r.get('prop_address'))} with address")
-
 if __name__=="__main__":
     asyncio.run(main())
