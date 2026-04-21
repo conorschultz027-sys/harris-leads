@@ -175,18 +175,21 @@ class ClerkScraper:
             if len(rows)<2: continue
             hdrs=[th.get_text(" ",strip=True).lower() for th in rows[0].find_all(["th","td"])]
             joined=" ".join(hdrs)
-            if not any(k in joined for k in ("doc","filed","grantor","instrument","grantee","file no","or name","ee name")): continue
+            # Match actual Harris County column headers:
+            # 'File Number', 'File Date', 'Type Vol Page', 'Names', 'Legal Description'
+            if not any(k in joined for k in ("file number","file date","names","grantor","instrument","grantee")): continue
             if len(hdrs)<3: continue
             col={}
             for i,h in enumerate(hdrs):
                 hl=h.lower()
-                if any(x in hl for x in ("file no","doc no","doc num","instrument","film","number")): col.setdefault("doc_num",i)
-                elif any(x in hl for x in ("filed","record date","date")): col.setdefault("filed",i)
-                elif any(x in hl for x in ("grantor","or name","debtor","seller")): col.setdefault("grantor",i)
-                elif any(x in hl for x in ("grantee","ee name","creditor","buyer")): col.setdefault("grantee",i)
-                elif any(x in hl for x in ("legal","description","subdiv")): col.setdefault("legal",i)
-                elif any(x in hl for x in ("amount","consid")): col.setdefault("amount",i)
-            if "doc_num" not in col and "filed" not in col: continue
+                if "file number" in hl or "file no" in hl: col.setdefault("doc_num",i)
+                elif "file date" in hl or "date" in hl: col.setdefault("filed",i)
+                elif "names" in hl or "grantor" in hl or "or name" in hl: col.setdefault("grantor",i)
+                elif "grantee" in hl or "ee name" in hl: col.setdefault("grantee",i)
+                elif "legal" in hl or "description" in hl: col.setdefault("legal",i)
+                elif "amount" in hl or "consid" in hl: col.setdefault("amount",i)
+                elif "type" in hl and "vol" in hl: col.setdefault("type_vol",i)
+            if "doc_num" not in col: continue
             for row in rows[1:]:
                 cells=row.find_all("td")
                 if not cells: continue
