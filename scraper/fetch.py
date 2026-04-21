@@ -216,8 +216,16 @@ class ClerkScraper:
                     for fmt in ("%m/%d/%Y","%Y-%m-%d","%m-%d-%Y"):
                         try: fd=datetime.strptime(t("filed").strip(),fmt).strftime("%Y-%m-%d"); break
                         except: pass
+                    # Names column = "Grantor : OWNER NAME Grantee : OTHER NAME"
+                    names_raw = t("grantor")
+                    grantor, grantee = "", t("grantee")
+                    if names_raw:
+                        gtor = re.search(r"[Gg]rantor\s*:\s*(.+?)(?:\s*[Gg]rantee|$)", names_raw, re.DOTALL)
+                        gtee = re.search(r"[Gg]rantee\s*:\s*(.+?)$", names_raw, re.DOTALL)
+                        grantor = gtor.group(1).strip() if gtor else names_raw.strip()
+                        if gtee: grantee = gtee.group(1).strip()
                     recs.append({"doc_num":doc_num,"doc_type":code,"filed":fd,"cat":cat,"cat_label":label,
-                        "owner":t("grantor"),"grantee":t("grantee"),"amount":amt,"legal":t("legal"),
+                        "owner":grantor,"grantee":grantee,"amount":amt,"legal":t("legal"),
                         "prop_address":"","prop_city":"","prop_state":"","prop_zip":"",
                         "mail_address":"","mail_city":"","mail_state":"","mail_zip":"",
                         "clerk_url":url,"flags":[],"score":0})
@@ -254,11 +262,20 @@ class ParcelLookup:
         if not dbf.exists(): return False
         try:
             count=0
-            for row in DBF(str(dbf),encoding="latin-1",ignore_missing_memofile=True):
+            # ignore_missing_memofile=True + raw=True handles unknown field types
+            table = DBF(str(dbf), encoding="latin-1", ignore_missing_memofile=True, raw=True)
+            for row in table:
                 try:
-                    row=dict(row); owner=self._col(row,["OWNER","OWN1","OWNER_NAME"])
+                    # Decode raw bytes values
+                    decoded = {}
+                    for k,v in row.items():
+                        if isinstance(v, bytes):
+                            decoded[k] = v.decode("latin-1","ignore").strip()
+                        else:
+                            decoded[k] = str(v).strip() if v is not None else ""
+                    owner=self._col(decoded,["OWNER","OWN1","OWNER_NAME"])
                     if not owner: continue
-                    for v in self._variants(owner): self._idx.setdefault(v,row)
+                    for v in self._variants(owner): self._idx.setdefault(v,decoded)
                     count+=1
                 except: continue
             log.info(f"Parcel: {count:,}"); return True
