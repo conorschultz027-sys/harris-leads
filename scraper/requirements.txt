@@ -1,5 +1,5 @@
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-lxml>=4.9.3
-dbfread>=2.0.7
-playwright>=1.40.0
+playwright
+beautifulsoup4
+lxml
+requests
+gdown
