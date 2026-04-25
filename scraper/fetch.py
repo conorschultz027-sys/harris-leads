@@ -1,117 +1,534 @@
-name: Scrape Harris County Leads
-on:
-  schedule:
-    - cron: "0 7 * * *"
-  workflow_dispatch:
+"""
+Harris County Motivated Seller Lead Scraper v10
+- Names: clean Grantor/Grantee split
+- Addresses: HCAD owners.txt + real_acct.txt (tab-delimited text, no DBF)
+- Scoring: recalibrated, foreclosure/LP starts Hot
+- All dead-code flag bugs fixed
+"""
+import asyncio, csv, json, logging, os, re, io, zipfile
+from datetime import datetime, timedelta
+from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
 
-permissions:
-  contents: write
-  pages: write
-  id-token: write
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
-jobs:
-  scrape:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+BASE_URL = "https://www.cclerk.hctx.net"
+RP_URL   = f"{BASE_URL}/applications/websearch/RP.aspx"
+LOOKBACK = int(os.environ.get("LOOKBACK_DAYS", 7))
+HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: scraper/requirements.txt
+F_FROM   = "ctl00$ContentPlaceHolder1$txtFrom"
+F_TO     = "ctl00$ContentPlaceHolder1$txtTo"
+F_INST   = "ctl00$ContentPlaceHolder1$txtInstrument"
+F_BTN_ID = "ctl00_ContentPlaceHolder1_btnSearch"
 
-      - name: Install Python dependencies
-        run: pip install -r scraper/requirements.txt
+OUTPUT_PATHS = [Path("dashboard/records.json"), Path("data/records.json")]
+GHL_CSV      = Path("data/ghl_export.csv")
+HCAD_ZIP     = Path("data/Real_acct_owner.zip")
+HCAD_URL     = "https://drive.google.com/uc?export=download&id=1edpPMYI5rzx6nCGH5x8tGdo3JuyluNR8&confirm=t"
 
-      - name: Install Playwright + Chromium
-        run: python -m playwright install --with-deps chromium
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
-      - name: Cache HCAD parcel data
-        id: hcad-cache
-        uses: actions/cache@v4
-        with:
-          path: data/Real_acct_owner.zip
-          key: hcad-week-${{ github.run_id }}
-          restore-keys: |
-            hcad-week-
+DOC_TYPES = {
+    "L/P":    ("foreclosure", "Lis Pendens"),
+    "NOTICE": ("foreclosure", "Notice of Foreclosure"),
+    "TRSALE": ("tax",         "Tax/Sheriff Deed"),
+    "JUDGE":  ("judgment",    "Abstract of Judgment"),
+    "A/J":    ("judgment",    "Abstract of Judgment"),
+    "DEED":   ("tax",         "Tax/Sheriff Deed"),
+    "T/L":    ("tax_lien",    "Federal Tax Lien"),
+    "LIEN":   ("lien",        "Lien"),
+    "M/L":    ("lien",        "Mechanic Lien"),
+    "HOA":    ("lien",        "HOA Lien"),
+    "MED":    ("lien",        "Medicaid Lien"),
+    "REL":    ("release",     "Release"),
+    "PROB":   ("probate",     "Probate Document"),
+}
 
-      - name: Download HCAD parcel data from Google Drive
-        run: |
-          mkdir -p data
-          if [ -f data/Real_acct_owner.zip ]; then
-            SIZE=$(stat -c%s data/Real_acct_owner.zip)
-            echo "Cached file size: $SIZE bytes"
-            if [ "$SIZE" -gt 50000000 ]; then
-              echo "Cache valid, skipping download"
-              exit 0
-            else
-              echo "Cache too small, re-downloading..."
-              rm data/Real_acct_owner.zip
-            fi
-          fi
-          FILE_ID="1edpPMYI5rzx6nCGH5x8tGdo3JuyluNR8"
-          echo "Downloading from Google Drive..."
-          pip install gdown -q
-          gdown "https://drive.google.com/uc?id=${FILE_ID}" -O data/Real_acct_owner.zip
-          SIZE=$(stat -c%s data/Real_acct_owner.zip)
-          echo "Downloaded size: $SIZE bytes"
-          if [ "$SIZE" -lt 50000000 ]; then
-            echo "ERROR: File too small - download failed"
-            exit 1
-          fi
-          echo "Done: $(du -sh data/Real_acct_owner.zip)"
+ENTITY_KEYWORDS = ("LLC", "INC", "CORP", "LTD", "LP ", "L.P.", "L.L.C", "TRUST",
+                   "FUND", "VENTURE", "CAPITAL", "PROPERTIES", "GROUP", "MGMT",
+                   "PARTNERSHIP", "PTNSH", "ASSOC", "HOLDING")
 
-      - name: Verify HCAD file
-        run: |
-          ls -lh data/Real_acct_owner.zip
-          python3 -c "
-          import zipfile
-          z = zipfile.ZipFile('data/Real_acct_owner.zip')
-          print('Files in zip:', z.namelist())
-          "
 
-      - name: Run scraper
-        env:
-          LOOKBACK_DAYS: "7"
-          HEADLESS: "true"
-        run: python scraper/fetch.py
+# ── Name utilities ────────────────────────────────────────────────────────────
 
-      - name: Commit updated records
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add dashboard/records.json data/records.json data/ghl_export.csv || true
-          git diff --cached --quiet && echo "No changes to commit" || \
-            git commit -m "chore: update leads $(date -u +%Y-%m-%d)"
-          git pull --rebase && git push
+def clean(s):
+    return re.sub(r"\s+", " ", (s or "").upper().strip())
 
-  deploy-pages:
-    needs: scrape
-    runs-on: ubuntu-22.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: main
+def name_tokens(name):
+    """Sorted frozenset of significant tokens — used for fuzzy matching."""
+    stop = {"THE", "OF", "AND", "A", "AN", "AT", "IN", "FOR"}
+    tokens = re.findall(r"[A-Z0-9]+", name.upper())
+    return frozenset(t for t in tokens if t not in stop and len(t) > 1)
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
+def parse_names(names_raw, fallback_grantee=""):
+    """Split 'Grantor : NAME Grantee : NAME' into (grantor, grantee)."""
+    if not names_raw:
+        return "", fallback_grantee
+    grantor_m  = re.search(r"[Gg]rantor\s*:\s*(.+?)(?=\s*[Gg]rantee\s*:|$)", names_raw, re.DOTALL)
+    grantee_ms = re.findall(r"[Gg]rantee\s*:\s*(.+?)(?=\s*[Gg]rantee\s*:|$)", names_raw, re.DOTALL)
+    grantor = clean(grantor_m.group(1)) if grantor_m else clean(names_raw)
+    grantee = " / ".join(clean(g) for g in grantee_ms if g.strip())
+    if not grantor_m and not grantee_ms:
+        grantee = fallback_grantee
+    return grantor, grantee
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: dashboard/
+def split_name_for_ghl(full_name):
+    nm = (full_name or "").strip()
+    if not nm:
+        return "", ""
+    if any(kw in nm.upper() for kw in ENTITY_KEYWORDS):
+        return "", nm
+    if "," in nm:
+        parts = nm.split(",", 1)
+        return parts[1].strip(), parts[0].strip()
+    parts = nm.split()
+    return (" ".join(parts[:-1]), parts[-1]) if len(parts) > 1 else ("", parts[0])
 
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
+
+def compute_flags(r, now):
+    flags = []
+    cat, dt = r.get("cat", ""), r.get("doc_type", "")
+    owner = (r.get("owner") or "").upper()
+    if dt == "L/P" or cat == "foreclosure":
+        flags.append("Lis pendens")
+    if dt == "NOTICE":
+        flags.append("Notice of foreclosure")
+    if cat == "judgment":
+        flags.append("Judgment lien")
+    if cat in ("tax", "tax_lien"):
+        flags.append("Tax lien")
+    if dt == "MED":
+        flags.append("Medicaid lien")
+    if cat == "probate":
+        flags.append("Probate / estate")
+    if any(k in owner for k in ENTITY_KEYWORDS):
+        flags.append("LLC / corp owner")
+    try:
+        filed = r.get("filed")
+        if filed and (now - datetime.strptime(filed, "%Y-%m-%d")).days <= 7:
+            flags.append("New this week")
+    except Exception:
+        pass
+    return flags
+
+def compute_score(r, flags):
+    base = {"foreclosure": 65, "tax": 55, "tax_lien": 55,
+            "judgment": 50, "lien": 45, "probate": 50, "release": 20}.get(r.get("cat", ""), 30)
+    s = base
+    s += len([f for f in flags if f not in ("LLC / corp owner", "New this week")]) * 8
+    if r.get("doc_type") in ("L/P", "NOTICE"):
+        s += 15
+    try:
+        a = float(str(r.get("amount") or 0).replace(",", "").replace("$", ""))
+        s += 15 if a > 100000 else 10 if a > 50000 else 5 if a > 10000 else 0
+    except Exception:
+        pass
+    if "New this week" in flags: s += 5
+    if r.get("prop_address"):    s += 5
+    return min(s, 100)
+
+
+# ── HCAD Address Lookup ───────────────────────────────────────────────────────
+
+class HCADLookup:
+    """
+    Reads owners.txt and real_acct.txt from Real_acct_owner.zip.
+    Builds: name -> acct (exact + token fuzzy)
+            acct -> address fields
+    """
+
+    def __init__(self):
+        self._name_to_acct  = {}   # exact upper name -> acct
+        self._token_to_acct = {}   # frozenset of tokens -> acct  (fuzzy)
+        self._acct_to_addr  = {}   # acct -> address dict
+        self._loaded        = False
+
+    # ── Internal loaders ──────────────────────────────────────────────────────
+
+    def _load_addresses(self, zf):
+        """Parse real_acct.txt: acct(0) mail_addr_1(3) mail_city(5)
+           mail_state(6) mail_zip(7) site_addr_1(17) site_addr_2(18) site_addr_3(19)"""
+        log.info("Loading real_acct.txt addresses...")
+        count = 0
+        with zf.open("real_acct.txt") as fh:
+            header = fh.readline()  # skip header
+            for raw in fh:
+                try:
+                    p = raw.decode("latin-1", "ignore").rstrip("\r\n").split("\t")
+                    if len(p) < 20:
+                        continue
+                    acct = p[0].strip()
+                    if not acct:
+                        continue
+                    site = " ".join(filter(None, [p[17].strip(), p[18].strip()])).strip()
+                    self._acct_to_addr[acct] = {
+                        "prop_address": site,
+                        "prop_city":    p[18].strip(),
+                        "prop_state":   "TX",
+                        "prop_zip":     p[19].strip(),
+                        "mail_address": p[3].strip(),
+                        "mail_city":    p[5].strip(),
+                        "mail_state":   p[6].strip() or "TX",
+                        "mail_zip":     p[7].strip(),
+                    }
+                    count += 1
+                except Exception:
+                    continue
+        log.info(f"  {count:,} address records loaded")
+
+    def _load_owners(self, zf):
+        """Parse owners.txt: acct(0) name(2). Build name->acct index."""
+        log.info("Loading owners.txt name index...")
+        count = 0
+        with zf.open("owners.txt") as fh:
+            fh.readline()  # skip header
+            for raw in fh:
+                try:
+                    p   = raw.decode("latin-1", "ignore").rstrip("\r\n").split("\t")
+                    if len(p) < 3:
+                        continue
+                    acct = p[0].strip()
+                    name = clean(p[2])
+                    if not acct or not name or name in ("CURRENT OWNER", ""):
+                        continue
+                    # Only index if we have address data for this acct
+                    if acct not in self._acct_to_addr:
+                        continue
+                    # Exact index (first owner only per name)
+                    self._name_to_acct.setdefault(name, acct)
+                    # Token index
+                    toks = name_tokens(name)
+                    if len(toks) >= 2:
+                        self._token_to_acct.setdefault(toks, acct)
+                    count += 1
+                except Exception:
+                    continue
+        log.info(f"  {count:,} owner name records indexed")
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def _ensure_zip(self):
+        """Download HCAD zip from Google Drive if not present."""
+        HCAD_ZIP.parent.mkdir(parents=True, exist_ok=True)
+        if HCAD_ZIP.exists() and HCAD_ZIP.stat().st_size > 50_000_000:
+            log.info(f"HCAD zip already present ({HCAD_ZIP.stat().st_size // 1_000_000} MB)")
+            return True
+        log.info("Downloading HCAD data from Google Drive...")
+        try:
+            import gdown
+            FILE_ID = "1edpPMYI5rzx6nCGH5x8tGdo3JuyluNR8"
+            gdown.download(id=FILE_ID, output=str(HCAD_ZIP), quiet=False)
+            size = HCAD_ZIP.stat().st_size if HCAD_ZIP.exists() else 0
+            if size < 50_000_000:
+                log.error(f"Downloaded file too small ({size} bytes)")
+                return False
+            log.info(f"Saved {HCAD_ZIP} ({size // 1_000_000} MB)")
+            return True
+        except Exception as e:
+            log.error(f"HCAD download failed: {e}")
+            return False
+
+    def load(self):
+        if not self._ensure_zip():
+            return False
+        try:
+            with zipfile.ZipFile(HCAD_ZIP) as zf:
+                self._load_addresses(zf)
+                self._load_owners(zf)
+            self._loaded = True
+            log.info(f"HCAD ready: {len(self._name_to_acct):,} names, "
+                     f"{len(self._acct_to_addr):,} addresses")
+            return True
+        except Exception as e:
+            log.error(f"HCAD load error: {e}")
+            return False
+
+    def lookup(self, name):
+        if not self._loaded or not name:
+            return {}
+        key = clean(name)
+
+        # 1. Exact match
+        acct = self._name_to_acct.get(key)
+
+        # 2. Truncated exact (HCAD names are sometimes cut at 25-30 chars)
+        if not acct and len(key) > 20:
+            for n, a in self._name_to_acct.items():
+                if n.startswith(key[:20]) or key.startswith(n[:20]):
+                    acct = a
+                    break
+
+        # 3. Token fuzzy match
+        if not acct:
+            toks = name_tokens(key)
+            if len(toks) >= 2:
+                best_score, best_acct = 0, None
+                for idx_toks, a in self._token_to_acct.items():
+                    shared = len(toks & idx_toks)
+                    if shared >= 2:
+                        score = shared / max(len(toks), len(idx_toks))
+                        if score > best_score:
+                            best_score, best_acct = score, a
+                if best_score >= 0.7:
+                    acct = best_acct
+
+        if not acct:
+            return {}
+
+        addr = self._acct_to_addr.get(acct, {})
+        return addr if addr.get("prop_address") or addr.get("mail_address") else {}
+
+
+# ── Scraper ───────────────────────────────────────────────────────────────────
+
+class ClerkScraper:
+    def __init__(self, df, dt):
+        self.df = df; self.dt = dt; self.records = []
+
+    async def run(self):
+        if not PLAYWRIGHT_AVAILABLE:
+            log.error("Playwright not installed"); return []
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=HEADLESS,
+                args=["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-blink-features=AutomationControlled"])
+            ctx = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width": 1366, "height": 768},
+                locale="en-US", timezone_id="America/Chicago")
+            await ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+            page = await ctx.new_page()
+            await page.goto(f"{BASE_URL}/applications/websearch/Home.aspx",
+                            timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+            for code, (cat, label) in DOC_TYPES.items():
+                for attempt in range(3):
+                    try:
+                        await self._search(page, code, cat, label); break
+                    except Exception as e:
+                        log.warning(f"[{code}] attempt {attempt+1}: {e}")
+                        if attempt < 2: await asyncio.sleep(3)
+            await browser.close()
+        log.info(f"Total scraped: {len(self.records)}")
+        return self.records
+
+    async def _search(self, page, code, cat, label):
+        log.info(f"Searching: {code}")
+        await page.goto(RP_URL, timeout=60000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        df_str = self.df.strftime("%m/%d/%Y")
+        dt_str = self.dt.strftime("%m/%d/%Y")
+        await page.evaluate(f"""() => {{
+            document.querySelector("input[name='{F_FROM}']").value = '{df_str}';
+            document.querySelector("input[name='{F_TO}']").value   = '{dt_str}';
+            document.querySelector("input[name='{F_INST}']").value = '{code}';
+        }}""")
+        clicked = await page.evaluate(f"""() => {{
+            const btn = document.getElementById('{F_BTN_ID}');
+            if (btn) {{ btn.click(); return true; }}
+            return false;
+        }}""")
+        log.info(f"  [{code}] button clicked: {clicked}")
+        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_timeout(2000)
+        html = await page.content()
+        soup = BeautifulSoup(html, "lxml")
+        recs = self._parse(soup, code, cat, label)
+        self.records.extend(recs)
+        log.info(f"  [{code}] page 1: {len(recs)} records")
+        pg = 1
+        while pg < 50:
+            try:
+                nxt = page.locator("a:has-text('Next'), input[value='Next >']").first
+                if await nxt.count() == 0: break
+                await nxt.click()
+                await page.wait_for_load_state("networkidle", timeout=20000)
+                html = await page.content()
+                soup = BeautifulSoup(html, "lxml")
+                recs = self._parse(soup, code, cat, label)
+                self.records.extend(recs)
+                pg += 1
+                log.info(f"  [{code}] page {pg}: {len(recs)} records")
+                if not recs: break
+            except Exception as e:
+                log.warning(f"  [{code}] pagination stopped at page {pg}: {e}"); break
+
+    def _parse(self, soup, code, cat, label):
+        recs = []
+        for tbl in soup.find_all("table"):
+            rows = tbl.find_all("tr")
+            if len(rows) < 2: continue
+            hdrs = [th.get_text(" ", strip=True).lower()
+                    for th in rows[0].find_all(["th", "td"])]
+            joined = " ".join(hdrs)
+            if not any(k in joined for k in
+                       ("file number","file date","names","grantor","instrument","grantee")):
+                continue
+            if len(hdrs) < 3: continue
+            col = {}
+            for i, h in enumerate(hdrs):
+                if "file number" in h or "file no" in h: col.setdefault("doc_num", i)
+                elif "file date" in h or "date" in h:   col.setdefault("filed", i)
+                elif "names" in h or "grantor" in h:    col.setdefault("names", i)
+                elif "grantee" in h:                    col.setdefault("grantee", i)
+                elif "legal" in h or "description" in h: col.setdefault("legal", i)
+                elif "amount" in h or "consid" in h:    col.setdefault("amount", i)
+            if "doc_num" not in col: continue
+            for row in rows[1:]:
+                cells = row.find_all("td")
+                if not cells: continue
+                try:
+                    def t(k):
+                        i = col.get(k)
+                        return cells[i].get_text(" ", strip=True) if i is not None and i < len(cells) else ""
+                    doc_num = t("doc_num")
+                    if not doc_num or len(doc_num) < 2: continue
+                    url = ""
+                    for cell in cells:
+                        a = cell.find("a", href=True)
+                        if a:
+                            href = a["href"]
+                            url  = href if href.startswith("http") else BASE_URL+"/"+href.lstrip("/")
+                            break
+                    if not url: url = f"{RP_URL}?FileNum={doc_num}"
+                    amt = None
+                    try:
+                        raw = re.sub(r"[^\d.]", "", t("amount"))
+                        if raw: amt = float(raw)
+                    except Exception: pass
+                    fd = ""
+                    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+                        try: fd = datetime.strptime(t("filed").strip(), fmt).strftime("%Y-%m-%d"); break
+                        except Exception: pass
+                    grantor, grantee = parse_names(t("names"), t("grantee"))
+                    recs.append({
+                        "doc_num": doc_num, "doc_type": code, "filed": fd,
+                        "cat": cat, "cat_label": label,
+                        "owner": grantor, "grantee": grantee,
+                        "amount": amt, "legal": t("legal"),
+                        "prop_address": "", "prop_city": "", "prop_state": "", "prop_zip": "",
+                        "mail_address": "", "mail_city": "", "mail_state": "", "mail_zip": "",
+                        "clerk_url": url, "flags": [], "score": 0,
+                    })
+                except Exception as e:
+                    log.debug(f"Row parse error: {e}")
+        return recs
+
+
+# ── GHL Export ────────────────────────────────────────────────────────────────
+
+GHL_COLS = [
+    "First Name","Last Name",
+    "Mailing Address","Mailing City","Mailing State","Mailing Zip",
+    "Property Address","Property City","Property State","Property Zip",
+    "Lead Type","Document Type","Date Filed","Document Number",
+    "Amount/Debt Owed","Seller Score","Motivated Seller Flags",
+    "Source","Public Records URL",
+]
+
+def write_ghl(records, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=GHL_COLS)
+        w.writeheader()
+        for r in records:
+            try:
+                first, last = split_name_for_ghl(r.get("owner", ""))
+                w.writerow({
+                    "First Name": first, "Last Name": last,
+                    "Mailing Address": r.get("mail_address",""),
+                    "Mailing City":    r.get("mail_city",""),
+                    "Mailing State":   r.get("mail_state",""),
+                    "Mailing Zip":     r.get("mail_zip",""),
+                    "Property Address": r.get("prop_address",""),
+                    "Property City":    r.get("prop_city",""),
+                    "Property State":   r.get("prop_state",""),
+                    "Property Zip":     r.get("prop_zip",""),
+                    "Lead Type":        r.get("cat_label",""),
+                    "Document Type":    r.get("doc_type",""),
+                    "Date Filed":       r.get("filed",""),
+                    "Document Number":  r.get("doc_num",""),
+                    "Amount/Debt Owed": r.get("amount",""),
+                    "Seller Score":     r.get("score",0),
+                    "Motivated Seller Flags": "; ".join(r.get("flags",[])),
+                    "Source": "Harris County Clerk",
+                    "Public Records URL": r.get("clerk_url",""),
+                })
+            except Exception as e:
+                log.debug(f"GHL row error: {e}")
+    log.info(f"GHL CSV: {path} ({len(records)} rows)")
+
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+def write_output(records, df, dt):
+    payload = {
+        "fetched_at":   datetime.utcnow().isoformat()+"Z",
+        "source":       "Harris County Clerk",
+        "date_range":   {"from": df.strftime("%Y-%m-%d"), "to": dt.strftime("%Y-%m-%d")},
+        "total":        len(records),
+        "with_address": sum(1 for r in records if r.get("prop_address")),
+        "records":      records,
+    }
+    for p in OUTPUT_PATHS:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        log.info(f"→ {p}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+async def main():
+    now = datetime.utcnow()
+    dt  = now
+    df  = now - timedelta(days=LOOKBACK)
+    log.info(f"Harris County Scraper v10 | {df.date()} → {dt.date()}")
+
+    records = await ClerkScraper(df, dt).run()
+
+    hcad   = HCADLookup()
+    loaded = hcad.load()
+    if not loaded:
+        log.warning("HCAD lookup unavailable — addresses will be empty")
+
+    for r in records:
+        try:
+            if loaded:
+                addr = hcad.lookup(r.get("owner", ""))
+                if addr: r.update(addr)
+            flags      = compute_flags(r, now)
+            r["flags"] = flags
+            r["score"] = compute_score(r, flags)
+        except Exception as e:
+            log.debug(f"Enrich error: {e}")
+
+    records.sort(key=lambda r: r.get("score", 0), reverse=True)
+    seen, unique = set(), []
+    for r in records:
+        k = r.get("doc_num") or (r.get("owner","") + r.get("filed",""))
+        if k and k not in seen:
+            seen.add(k); unique.append(r)
+    records = unique
+
+    write_output(records, df, dt)
+    write_ghl(records, GHL_CSV)
+
+    with_addr = sum(1 for r in records if r.get("prop_address"))
+    log.info(f"Done: {len(records)} records | {with_addr} with address")
+    log.info(f"Hot  (≥70): {sum(1 for r in records if r.get('score',0)>=70)}")
+    log.info(f"Warm (50-69): {sum(1 for r in records if 50<=r.get('score',0)<70)}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
