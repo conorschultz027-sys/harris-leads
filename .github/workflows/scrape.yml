@@ -1,5 +1,4 @@
 name: Scrape Harris County Leads
-
 on:
   schedule:
     # 07:00 UTC daily  (≈ 02:00 CST / 01:00 CDT)
@@ -15,7 +14,6 @@ jobs:
   scrape:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,6 +33,31 @@ jobs:
 
       - name: Install Playwright + Chromium
         run: python -m playwright install --with-deps chromium
+
+      # Cache the HCAD zip — keyed by week so it re-downloads once a week
+      - name: Cache HCAD parcel data
+        id: hcad-cache
+        uses: actions/cache@v4
+        with:
+          path: data/Real_acct_owner.zip
+          key: hcad-${{ github.run_id }}
+          restore-keys: |
+            hcad-
+
+      - name: Download HCAD parcel data (if not cached)
+        if: steps.hcad-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data
+          echo "Downloading HCAD Real_acct_owner.zip..."
+          curl -L --retry 3 --retry-delay 5 \
+            "https://pdata.hcad.org/Pdata/download/Real_acct_owner.zip" \
+            -o data/Real_acct_owner.zip
+          echo "Download complete: $(du -sh data/Real_acct_owner.zip)"
+
+      - name: Verify HCAD file
+        run: |
+          ls -lh data/Real_acct_owner.zip
+          python3 -c "import zipfile; z=zipfile.ZipFile('data/Real_acct_owner.zip'); print('Files in zip:', z.namelist())"
 
       - name: Run scraper
         env:
@@ -57,7 +80,6 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
