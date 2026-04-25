@@ -1,7 +1,6 @@
 name: Scrape Harris County Leads
 on:
   schedule:
-    # 07:00 UTC daily  (≈ 02:00 CST / 01:00 CDT)
     - cron: "0 7 * * *"
   workflow_dispatch:
 
@@ -43,7 +42,7 @@ jobs:
           restore-keys: |
             hcad-week-
 
-      - name: Download HCAD parcel data
+      - name: Download HCAD parcel data from Google Drive
         run: |
           mkdir -p data
           if [ -f data/Real_acct_owner.zip ]; then
@@ -53,20 +52,18 @@ jobs:
               echo "Cache valid, skipping download"
               exit 0
             else
-              echo "Cache too small ($SIZE bytes), re-downloading..."
+              echo "Cache too small, re-downloading..."
               rm data/Real_acct_owner.zip
             fi
           fi
-          echo "Downloading HCAD Real_acct_owner.zip..."
-          wget --tries=3 --wait=5 --timeout=300 \
-            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-            "https://pdata.hcad.org/Pdata/download/Real_acct_owner.zip" \
-            -O data/Real_acct_owner.zip
+          FILE_ID="1edpPMYI5rzx6nCGH5x8tGdo3JuyluNR8"
+          echo "Downloading from Google Drive..."
+          pip install gdown -q
+          gdown "https://drive.google.com/uc?id=${FILE_ID}" -O data/Real_acct_owner.zip
           SIZE=$(stat -c%s data/Real_acct_owner.zip)
           echo "Downloaded size: $SIZE bytes"
           if [ "$SIZE" -lt 50000000 ]; then
-            echo "ERROR: File too small - likely an error page"
-            cat data/Real_acct_owner.zip
+            echo "ERROR: File too small - download failed"
             exit 1
           fi
           echo "Done: $(du -sh data/Real_acct_owner.zip)"
