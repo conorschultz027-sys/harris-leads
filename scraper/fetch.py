@@ -1,13 +1,9 @@
 """
-Harris County Motivated Seller Lead Scraper v9
-Fixes:
-  - Clean Grantor/Grantee name splitting (no more blobs)
-  - Robust HCAD address lookup with auto-detected DBF field names
-  - Fixed dead-code flag bugs (NOTICE, MED)
-  - Fixed doc_type flag checks (L/P not LP)
-  - Recalibrated scoring so foreclosure/LP leads score Hot
-  - LLC/CORP/TRUST name handling in GHL export
-  - Pagination errors logged instead of silently swallowed
+Harris County Motivated Seller Lead Scraper v10
+- Names: clean Grantor/Grantee split
+- Addresses: HCAD owners.txt + real_acct.txt (tab-delimited text, no DBF)
+- Scoring: recalibrated, foreclosure/LP starts Hot
+- All dead-code flag bugs fixed
 """
 import asyncio, csv, json, logging, os, re, io, zipfile
 from datetime import datetime, timedelta
@@ -21,18 +17,11 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
-try:
-    from dbfread import DBF
-    DBFREAD_AVAILABLE = True
-except ImportError:
-    DBFREAD_AVAILABLE = False
-
 BASE_URL = "https://www.cclerk.hctx.net"
 RP_URL   = f"{BASE_URL}/applications/websearch/RP.aspx"
 LOOKBACK = int(os.environ.get("LOOKBACK_DAYS", 7))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() != "false"
 
-# Confirmed field names from JS inspection
 F_FROM   = "ctl00$ContentPlaceHolder1$txtFrom"
 F_TO     = "ctl00$ContentPlaceHolder1$txtTo"
 F_INST   = "ctl00$ContentPlaceHolder1$txtInstrument"
@@ -40,6 +29,8 @@ F_BTN_ID = "ctl00_ContentPlaceHolder1_btnSearch"
 
 OUTPUT_PATHS = [Path("dashboard/records.json"), Path("data/records.json")]
 GHL_CSV      = Path("data/ghl_export.csv")
+HCAD_ZIP     = Path("data/Real_acct_owner.zip")
+HCAD_URL     = "https://pdata.hcad.org/Pdata/download/Real_acct_owner.zip"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -61,196 +52,272 @@ DOC_TYPES = {
 }
 
 ENTITY_KEYWORDS = ("LLC", "INC", "CORP", "LTD", "LP ", "L.P.", "L.L.C", "TRUST",
-                   "FUND", "VENTURE", "CAPITAL", "PROPERTIES", "GROUP", "MGMT")
+                   "FUND", "VENTURE", "CAPITAL", "PROPERTIES", "GROUP", "MGMT",
+                   "PARTNERSHIP", "PTNSH", "ASSOC", "HOLDING")
 
 
-# ── Name parsing ──────────────────────────────────────────────────────────────
+# ── Name utilities ────────────────────────────────────────────────────────────
+
+def clean(s):
+    return re.sub(r"\s+", " ", (s or "").upper().strip())
+
+def name_tokens(name):
+    """Sorted frozenset of significant tokens — used for fuzzy matching."""
+    stop = {"THE", "OF", "AND", "A", "AN", "AT", "IN", "FOR"}
+    tokens = re.findall(r"[A-Z0-9]+", name.upper())
+    return frozenset(t for t in tokens if t not in stop and len(t) > 1)
 
 def parse_names(names_raw, fallback_grantee=""):
-    """
-    Harris County Names column format:
-      'Grantor : OWNER NAME Grantee : OTHER NAME'
-    or multiple grantees:
-      'Grantor : NAME Grantee : NAME1 Grantee : NAME2'
-
-    Returns (grantor, grantee) as clean strings.
-    """
+    """Split 'Grantor : NAME Grantee : NAME' into (grantor, grantee)."""
     if not names_raw:
         return "", fallback_grantee
-
-    # Split on Grantor/Grantee markers (case-insensitive)
-    grantor_match = re.search(r"[Gg]rantor\s*:\s*(.+?)(?=\s*[Gg]rantee\s*:|$)", names_raw, re.DOTALL)
-    grantee_matches = re.findall(r"[Gg]rantee\s*:\s*(.+?)(?=\s*[Gg]rantee\s*:|$)", names_raw, re.DOTALL)
-
-    grantor = grantor_match.group(1).strip() if grantor_match else names_raw.strip()
-    grantee = " / ".join(g.strip() for g in grantee_matches if g.strip())
-
-    # If no markers found at all, treat whole string as grantor
-    if not grantor_match and not grantee_matches:
-        grantor = names_raw.strip()
+    grantor_m  = re.search(r"[Gg]rantor\s*:\s*(.+?)(?=\s*[Gg]rantee\s*:|$)", names_raw, re.DOTALL)
+    grantee_ms = re.findall(r"[Gg]rantee\s*:\s*(.+?)(?=\s*[Gg]rantee\s*:|$)", names_raw, re.DOTALL)
+    grantor = clean(grantor_m.group(1)) if grantor_m else clean(names_raw)
+    grantee = " / ".join(clean(g) for g in grantee_ms if g.strip())
+    if not grantor_m and not grantee_ms:
         grantee = fallback_grantee
-
-    # Clean up extra whitespace
-    grantor = re.sub(r"\s+", " ", grantor).strip()
-    grantee = re.sub(r"\s+", " ", grantee).strip()
-
     return grantor, grantee
 
-
 def split_name_for_ghl(full_name):
-    """
-    Split owner name into First / Last for GHL export.
-    Handles: individuals, LLCs, trusts, corps.
-    Returns (first, last).
-    """
-    if not full_name:
+    nm = (full_name or "").strip()
+    if not nm:
         return "", ""
-
-    nm = full_name.strip()
-
-    # Entity — put everything in Last, blank First
     if any(kw in nm.upper() for kw in ENTITY_KEYWORDS):
         return "", nm
-
-    # "Last, First" format
     if "," in nm:
         parts = nm.split(",", 1)
         return parts[1].strip(), parts[0].strip()
-
-    # "First Last" format
     parts = nm.split()
-    if len(parts) == 1:
-        return "", parts[0]
-    return " ".join(parts[:-1]), parts[-1]
+    return (" ".join(parts[:-1]), parts[-1]) if len(parts) > 1 else ("", parts[0])
 
 
-# ── Scoring & flags ───────────────────────────────────────────────────────────
+# ── Scoring ───────────────────────────────────────────────────────────────────
 
 def compute_flags(r, now):
     flags = []
-    cat    = r.get("cat", "")
-    dt     = r.get("doc_type", "")
-    owner  = (r.get("owner") or "").upper()
-
+    cat, dt = r.get("cat", ""), r.get("doc_type", "")
+    owner = (r.get("owner") or "").upper()
     if dt == "L/P" or cat == "foreclosure":
         flags.append("Lis pendens")
     if dt == "NOTICE":
-        flags.append("Notice of foreclosure")   # FIX: was dead tuple expression
+        flags.append("Notice of foreclosure")
     if cat == "judgment":
         flags.append("Judgment lien")
     if cat in ("tax", "tax_lien"):
         flags.append("Tax lien")
     if dt == "MED":
-        flags.append("Medicaid lien")           # FIX: was dead tuple expression
+        flags.append("Medicaid lien")
     if cat == "probate":
         flags.append("Probate / estate")
     if any(k in owner for k in ENTITY_KEYWORDS):
         flags.append("LLC / corp owner")
-
     try:
         filed = r.get("filed")
         if filed and (now - datetime.strptime(filed, "%Y-%m-%d")).days <= 7:
             flags.append("New this week")
     except Exception:
         pass
-
     return flags
 
-
 def compute_score(r, flags):
-    cat = r.get("cat", "")
-    dt  = r.get("doc_type", "")
-
-    # Base score by category — foreclosure/LP starts high
-    base = {
-        "foreclosure": 65,
-        "tax":         55,
-        "tax_lien":    55,
-        "judgment":    50,
-        "lien":        45,
-        "probate":     50,
-        "release":     20,
-    }.get(cat, 30)
-
+    base = {"foreclosure": 65, "tax": 55, "tax_lien": 55,
+            "judgment": 50, "lien": 45, "probate": 50, "release": 20}.get(r.get("cat", ""), 30)
     s = base
-
-    # Flag bonuses
     s += len([f for f in flags if f not in ("LLC / corp owner", "New this week")]) * 8
-
-    # Specific type bonus
-    if dt in ("L/P", "NOTICE") and cat == "foreclosure":
+    if r.get("doc_type") in ("L/P", "NOTICE"):
         s += 15
-    if dt == "PROB":
-        s += 10
-
-    # Amount bonus
     try:
         a = float(str(r.get("amount") or 0).replace(",", "").replace("$", ""))
-        if a > 100000:
-            s += 15
-        elif a > 50000:
-            s += 10
-        elif a > 10000:
-            s += 5
+        s += 15 if a > 100000 else 10 if a > 50000 else 5 if a > 10000 else 0
     except Exception:
         pass
-
-    if "New this week" in flags:
-        s += 5
-    if r.get("prop_address"):
-        s += 5
-
+    if "New this week" in flags: s += 5
+    if r.get("prop_address"):    s += 5
     return min(s, 100)
+
+
+# ── HCAD Address Lookup ───────────────────────────────────────────────────────
+
+class HCADLookup:
+    """
+    Reads owners.txt and real_acct.txt from Real_acct_owner.zip.
+    Builds: name -> acct (exact + token fuzzy)
+            acct -> address fields
+    """
+
+    def __init__(self):
+        self._name_to_acct  = {}   # exact upper name -> acct
+        self._token_to_acct = {}   # frozenset of tokens -> acct  (fuzzy)
+        self._acct_to_addr  = {}   # acct -> address dict
+        self._loaded        = False
+
+    # ── Internal loaders ──────────────────────────────────────────────────────
+
+    def _load_addresses(self, zf):
+        """Parse real_acct.txt: acct(0) mail_addr_1(3) mail_city(5)
+           mail_state(6) mail_zip(7) site_addr_1(17) site_addr_2(18) site_addr_3(19)"""
+        log.info("Loading real_acct.txt addresses...")
+        count = 0
+        with zf.open("real_acct.txt") as fh:
+            header = fh.readline()  # skip header
+            for raw in fh:
+                try:
+                    p = raw.decode("latin-1", "ignore").rstrip("\r\n").split("\t")
+                    if len(p) < 20:
+                        continue
+                    acct = p[0].strip()
+                    if not acct:
+                        continue
+                    site = " ".join(filter(None, [p[17].strip(), p[18].strip()])).strip()
+                    self._acct_to_addr[acct] = {
+                        "prop_address": site,
+                        "prop_city":    p[18].strip(),
+                        "prop_state":   "TX",
+                        "prop_zip":     p[19].strip(),
+                        "mail_address": p[3].strip(),
+                        "mail_city":    p[5].strip(),
+                        "mail_state":   p[6].strip() or "TX",
+                        "mail_zip":     p[7].strip(),
+                    }
+                    count += 1
+                except Exception:
+                    continue
+        log.info(f"  {count:,} address records loaded")
+
+    def _load_owners(self, zf):
+        """Parse owners.txt: acct(0) name(2). Build name->acct index."""
+        log.info("Loading owners.txt name index...")
+        count = 0
+        with zf.open("owners.txt") as fh:
+            fh.readline()  # skip header
+            for raw in fh:
+                try:
+                    p   = raw.decode("latin-1", "ignore").rstrip("\r\n").split("\t")
+                    if len(p) < 3:
+                        continue
+                    acct = p[0].strip()
+                    name = clean(p[2])
+                    if not acct or not name or name in ("CURRENT OWNER", ""):
+                        continue
+                    # Only index if we have address data for this acct
+                    if acct not in self._acct_to_addr:
+                        continue
+                    # Exact index (first owner only per name)
+                    self._name_to_acct.setdefault(name, acct)
+                    # Token index
+                    toks = name_tokens(name)
+                    if len(toks) >= 2:
+                        self._token_to_acct.setdefault(toks, acct)
+                    count += 1
+                except Exception:
+                    continue
+        log.info(f"  {count:,} owner name records indexed")
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def _ensure_zip(self):
+        """Download HCAD zip if not present."""
+        HCAD_ZIP.parent.mkdir(parents=True, exist_ok=True)
+        if HCAD_ZIP.exists():
+            return True
+        log.info(f"Downloading HCAD data from {HCAD_URL} ...")
+        try:
+            r = requests.get(HCAD_URL, timeout=300, stream=True)
+            r.raise_for_status()
+            with open(HCAD_ZIP, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    f.write(chunk)
+            log.info(f"Saved {HCAD_ZIP} ({HCAD_ZIP.stat().st_size // 1_000_000} MB)")
+            return True
+        except Exception as e:
+            log.error(f"HCAD download failed: {e}")
+            return False
+
+    def load(self):
+        if not self._ensure_zip():
+            return False
+        try:
+            with zipfile.ZipFile(HCAD_ZIP) as zf:
+                self._load_addresses(zf)
+                self._load_owners(zf)
+            self._loaded = True
+            log.info(f"HCAD ready: {len(self._name_to_acct):,} names, "
+                     f"{len(self._acct_to_addr):,} addresses")
+            return True
+        except Exception as e:
+            log.error(f"HCAD load error: {e}")
+            return False
+
+    def lookup(self, name):
+        if not self._loaded or not name:
+            return {}
+        key = clean(name)
+
+        # 1. Exact match
+        acct = self._name_to_acct.get(key)
+
+        # 2. Truncated exact (HCAD names are sometimes cut at 25-30 chars)
+        if not acct and len(key) > 20:
+            for n, a in self._name_to_acct.items():
+                if n.startswith(key[:20]) or key.startswith(n[:20]):
+                    acct = a
+                    break
+
+        # 3. Token fuzzy match
+        if not acct:
+            toks = name_tokens(key)
+            if len(toks) >= 2:
+                best_score, best_acct = 0, None
+                for idx_toks, a in self._token_to_acct.items():
+                    shared = len(toks & idx_toks)
+                    if shared >= 2:
+                        score = shared / max(len(toks), len(idx_toks))
+                        if score > best_score:
+                            best_score, best_acct = score, a
+                if best_score >= 0.7:
+                    acct = best_acct
+
+        if not acct:
+            return {}
+
+        addr = self._acct_to_addr.get(acct, {})
+        return addr if addr.get("prop_address") or addr.get("mail_address") else {}
 
 
 # ── Scraper ───────────────────────────────────────────────────────────────────
 
 class ClerkScraper:
     def __init__(self, df, dt):
-        self.df = df
-        self.dt = dt
-        self.records = []
+        self.df = df; self.dt = dt; self.records = []
 
     async def run(self):
         if not PLAYWRIGHT_AVAILABLE:
-            log.error("Playwright not installed")
-            return []
-
+            log.error("Playwright not installed"); return []
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
                 headless=HEADLESS,
                 args=["--no-sandbox", "--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled"]
-            )
+                      "--disable-blink-features=AutomationControlled"])
             ctx = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
-                locale="en-US",
-                timezone_id="America/Chicago",
-            )
+                locale="en-US", timezone_id="America/Chicago")
             await ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-            )
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
             page = await ctx.new_page()
-
-            # Warm up
             await page.goto(f"{BASE_URL}/applications/websearch/Home.aspx",
                             timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(2000)
-
             for code, (cat, label) in DOC_TYPES.items():
                 for attempt in range(3):
                     try:
-                        await self._search(page, code, cat, label)
-                        break
+                        await self._search(page, code, cat, label); break
                     except Exception as e:
                         log.warning(f"[{code}] attempt {attempt+1}: {e}")
-                        if attempt < 2:
-                            await asyncio.sleep(3)
-
+                        if attempt < 2: await asyncio.sleep(3)
             await browser.close()
-
         log.info(f"Total scraped: {len(self.records)}")
         return self.records
 
@@ -258,346 +325,115 @@ class ClerkScraper:
         log.info(f"Searching: {code}")
         await page.goto(RP_URL, timeout=60000, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
-
         df_str = self.df.strftime("%m/%d/%Y")
         dt_str = self.dt.strftime("%m/%d/%Y")
-
         await page.evaluate(f"""() => {{
             document.querySelector("input[name='{F_FROM}']").value = '{df_str}';
             document.querySelector("input[name='{F_TO}']").value   = '{dt_str}';
             document.querySelector("input[name='{F_INST}']").value = '{code}';
         }}""")
-
-        vals = await page.evaluate(f"""() => ({{
-            from: document.querySelector("input[name='{F_FROM}']")?.value,
-            to:   document.querySelector("input[name='{F_TO}']")?.value,
-            inst: document.querySelector("input[name='{F_INST}']")?.value,
-        }})""")
-        log.info(f"  Fields: {vals}")
-
         clicked = await page.evaluate(f"""() => {{
             const btn = document.getElementById('{F_BTN_ID}');
             if (btn) {{ btn.click(); return true; }}
             return false;
         }}""")
-        log.info(f"  Button clicked: {clicked}")
-
+        log.info(f"  [{code}] button clicked: {clicked}")
         await page.wait_for_load_state("networkidle", timeout=30000)
         await page.wait_for_timeout(2000)
-
-        html  = await page.content()
-        soup  = BeautifulSoup(html, "lxml")
-        recs  = self._parse(soup, code, cat, label)
+        html = await page.content()
+        soup = BeautifulSoup(html, "lxml")
+        recs = self._parse(soup, code, cat, label)
         self.records.extend(recs)
         log.info(f"  [{code}] page 1: {len(recs)} records")
-
-        # Pagination
         pg = 1
         while pg < 50:
             try:
                 nxt = page.locator("a:has-text('Next'), input[value='Next >']").first
-                if await nxt.count() == 0:
-                    break
+                if await nxt.count() == 0: break
                 await nxt.click()
                 await page.wait_for_load_state("networkidle", timeout=20000)
-                html  = await page.content()
-                soup  = BeautifulSoup(html, "lxml")
-                recs  = self._parse(soup, code, cat, label)
+                html = await page.content()
+                soup = BeautifulSoup(html, "lxml")
+                recs = self._parse(soup, code, cat, label)
                 self.records.extend(recs)
-                pg   += 1
+                pg += 1
                 log.info(f"  [{code}] page {pg}: {len(recs)} records")
-                if not recs:
-                    break
+                if not recs: break
             except Exception as e:
-                log.warning(f"  [{code}] pagination error on page {pg}: {e}")
-                break
+                log.warning(f"  [{code}] pagination stopped at page {pg}: {e}"); break
 
     def _parse(self, soup, code, cat, label):
         recs = []
         for tbl in soup.find_all("table"):
             rows = tbl.find_all("tr")
-            if len(rows) < 2:
-                continue
-
+            if len(rows) < 2: continue
             hdrs = [th.get_text(" ", strip=True).lower()
                     for th in rows[0].find_all(["th", "td"])]
             joined = " ".join(hdrs)
-
             if not any(k in joined for k in
-                       ("file number", "file date", "names", "grantor",
-                        "instrument", "grantee")):
+                       ("file number","file date","names","grantor","instrument","grantee")):
                 continue
-            if len(hdrs) < 3:
-                continue
-
+            if len(hdrs) < 3: continue
             col = {}
             for i, h in enumerate(hdrs):
-                hl = h.lower()
-                if "file number" in hl or "file no" in hl:
-                    col.setdefault("doc_num", i)
-                elif "file date" in hl or "date" in hl:
-                    col.setdefault("filed", i)
-                elif "names" in hl or "grantor" in hl or "or name" in hl:
-                    col.setdefault("names", i)   # unified "Names" column
-                elif "grantee" in hl or "ee name" in hl:
-                    col.setdefault("grantee", i)
-                elif "legal" in hl or "description" in hl:
-                    col.setdefault("legal", i)
-                elif "amount" in hl or "consid" in hl:
-                    col.setdefault("amount", i)
-                elif "type" in hl and "vol" in hl:
-                    col.setdefault("type_vol", i)
-
-            if "doc_num" not in col:
-                continue
-
+                if "file number" in h or "file no" in h: col.setdefault("doc_num", i)
+                elif "file date" in h or "date" in h:   col.setdefault("filed", i)
+                elif "names" in h or "grantor" in h:    col.setdefault("names", i)
+                elif "grantee" in h:                    col.setdefault("grantee", i)
+                elif "legal" in h or "description" in h: col.setdefault("legal", i)
+                elif "amount" in h or "consid" in h:    col.setdefault("amount", i)
+            if "doc_num" not in col: continue
             for row in rows[1:]:
                 cells = row.find_all("td")
-                if not cells:
-                    continue
+                if not cells: continue
                 try:
                     def t(k):
                         i = col.get(k)
-                        return (cells[i].get_text(" ", strip=True)
-                                if i is not None and i < len(cells) else "")
-
+                        return cells[i].get_text(" ", strip=True) if i is not None and i < len(cells) else ""
                     doc_num = t("doc_num")
-                    if not doc_num or len(doc_num) < 2:
-                        continue
-
-                    # Clerk URL
+                    if not doc_num or len(doc_num) < 2: continue
                     url = ""
                     for cell in cells:
                         a = cell.find("a", href=True)
                         if a:
                             href = a["href"]
-                            url  = (href if href.startswith("http")
-                                    else BASE_URL + "/" + href.lstrip("/"))
+                            url  = href if href.startswith("http") else BASE_URL+"/"+href.lstrip("/")
                             break
-                    if not url:
-                        url = f"{RP_URL}?FileNum={doc_num}"
-
-                    # Amount
+                    if not url: url = f"{RP_URL}?FileNum={doc_num}"
                     amt = None
                     try:
                         raw = re.sub(r"[^\d.]", "", t("amount"))
-                        if raw:
-                            amt = float(raw)
-                    except Exception:
-                        pass
-
-                    # Filed date
+                        if raw: amt = float(raw)
+                    except Exception: pass
                     fd = ""
                     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
-                        try:
-                            fd = datetime.strptime(t("filed").strip(), fmt).strftime("%Y-%m-%d")
-                            break
-                        except Exception:
-                            pass
-
-                    # ── Name parsing (KEY FIX) ──────────────────────────
-                    # Harris County uses ONE "Names" column containing both
-                    # "Grantor : NAME" and "Grantee : NAME" in the same cell.
-                    names_raw       = t("names")
-                    extra_grantee   = t("grantee")   # separate col if exists
-                    grantor, grantee = parse_names(names_raw, extra_grantee)
-
+                        try: fd = datetime.strptime(t("filed").strip(), fmt).strftime("%Y-%m-%d"); break
+                        except Exception: pass
+                    grantor, grantee = parse_names(t("names"), t("grantee"))
                     recs.append({
-                        "doc_num":      doc_num,
-                        "doc_type":     code,
-                        "filed":        fd,
-                        "cat":          cat,
-                        "cat_label":    label,
-                        "owner":        grantor,   # clean grantor name only
-                        "grantee":      grantee,   # clean grantee name(s)
-                        "amount":       amt,
-                        "legal":        t("legal"),
-                        "prop_address": "",
-                        "prop_city":    "",
-                        "prop_state":   "",
-                        "prop_zip":     "",
-                        "mail_address": "",
-                        "mail_city":    "",
-                        "mail_state":   "",
-                        "mail_zip":     "",
-                        "clerk_url":    url,
-                        "flags":        [],
-                        "score":        0,
+                        "doc_num": doc_num, "doc_type": code, "filed": fd,
+                        "cat": cat, "cat_label": label,
+                        "owner": grantor, "grantee": grantee,
+                        "amount": amt, "legal": t("legal"),
+                        "prop_address": "", "prop_city": "", "prop_state": "", "prop_zip": "",
+                        "mail_address": "", "mail_city": "", "mail_state": "", "mail_zip": "",
+                        "clerk_url": url, "flags": [], "score": 0,
                     })
                 except Exception as e:
                     log.debug(f"Row parse error: {e}")
-
         return recs
 
 
-# ── HCAD Parcel Lookup ────────────────────────────────────────────────────────
-
-class ParcelLookup:
-    """
-    Downloads HCAD Real_acct_owner.zip and builds an owner-name index.
-    Auto-detects actual DBF field names instead of assuming them.
-    """
-    URLS = [
-        "https://pdata.hcad.org/Pdata/download/Real_acct_owner.zip",
-        "https://pdata.hcad.org/data/download/Real_acct_owner.zip",
-    ]
-
-    def __init__(self):
-        self._idx        = {}
-        self._addr_fields = {}   # detected field name mapping
-
-    def _clean(self, n):
-        return re.sub(r"\s+", " ", (n or "").upper().strip())
-
-    def _variants(self, full):
-        p = full.split()
-        v = [full]
-        if len(p) >= 2:
-            v += [f"{p[-1]} {' '.join(p[:-1])}",
-                  f"{p[-1]}, {' '.join(p[:-1])}"]
-        return [self._clean(x) for x in v]
-
-    def _detect_fields(self, sample_row):
-        """
-        Auto-detect field names by pattern-matching against known HCAD field patterns.
-        Returns dict mapping logical name → actual DBF field name.
-        """
-        fields = {k: str(k) for k in sample_row.keys()}
-        mapping = {}
-
-        patterns = {
-            "owner":        ["OWNER", "OWN1", "OWNER_NAME", "OWNERNAME"],
-            "prop_address": ["SITE_ADDR", "SITEADDR", "SITE_AD", "STRADR",
-                             "STR_ADDR", "STRT_ADDR", "PROP_ADDR"],
-            "prop_city":    ["SITE_CITY", "SITECITY", "SITE_CTY", "PROP_CITY"],
-            "prop_zip":     ["SITE_ZIP",  "SITEZIP",  "SITE_ZP",  "PROP_ZIP"],
-            "mail_address": ["ADDR_1", "MAILADR1", "MAIL_ADDR", "MAIL_AD",
-                             "MAILING_ADDR", "MAIL1"],
-            "mail_city":    ["CITY", "MAILCITY", "MAIL_CITY", "MAIL_CTY"],
-            "mail_state":   ["STATE", "MAILSTATE", "MAIL_STATE", "MAIL_ST"],
-            "mail_zip":     ["ZIP", "MAILZIP", "MAIL_ZIP", "MAIL_ZP"],
-        }
-
-        upper_fields = {k.upper(): k for k in fields}
-
-        for logical, candidates in patterns.items():
-            for c in candidates:
-                if c in upper_fields:
-                    mapping[logical] = upper_fields[c]
-                    break
-
-        log.info(f"HCAD field mapping: {mapping}")
-        return mapping
-
-    def load(self):
-        if not DBFREAD_AVAILABLE:
-            log.warning("dbfread not installed — address lookup disabled")
-            return False
-
-        dbf_path = Path("data/parcel.dbf")
-        dbf_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if not dbf_path.exists():
-            for url in self.URLS:
-                try:
-                    log.info(f"Downloading HCAD parcel data from {url}...")
-                    r = requests.get(url, timeout=180)
-                    r.raise_for_status()
-                    raw = r.content
-                    if raw[:2] == b"PK":
-                        with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                            dbf_files = [n for n in z.namelist()
-                                         if n.lower().endswith(".dbf")]
-                            if dbf_files:
-                                dbf_path.write_bytes(z.read(dbf_files[0]))
-                                log.info(f"Extracted: {dbf_files[0]}")
-                    else:
-                        dbf_path.write_bytes(raw)
-                    log.info("Parcel DBF saved")
-                    break
-                except Exception as e:
-                    log.warning(f"HCAD download failed ({url}): {e}")
-
-        if not dbf_path.exists():
-            log.warning("Parcel DBF not available — addresses will be empty")
-            return False
-
-        try:
-            count   = 0
-            detected = False
-            table   = DBF(str(dbf_path), encoding="latin-1",
-                          ignore_missing_memofile=True, raw=True)
-
-            for row in table:
-                # Decode bytes → str
-                decoded = {}
-                for k, v in row.items():
-                    if isinstance(v, bytes):
-                        decoded[k] = v.decode("latin-1", "ignore").strip()
-                    else:
-                        decoded[k] = str(v).strip() if v is not None else ""
-
-                # Auto-detect field mapping on first row
-                if not detected:
-                    self._addr_fields = self._detect_fields(decoded)
-                    detected = True
-                    if "owner" not in self._addr_fields:
-                        log.error("Could not detect owner field in HCAD DBF")
-                        log.error(f"Available fields: {list(decoded.keys())[:20]}")
-                        return False
-
-                owner_field = self._addr_fields["owner"]
-                owner = decoded.get(owner_field, "")
-                if not owner:
-                    continue
-
-                for v in self._variants(owner):
-                    self._idx.setdefault(v, decoded)
-                count += 1
-
-            log.info(f"HCAD index built: {count:,} records")
-            return True
-
-        except Exception as e:
-            log.error(f"HCAD DBF load error: {e}")
-            return False
-
-    def lookup(self, name):
-        if not name or not self._idx or not self._addr_fields:
-            return {}
-
-        for variant in self._variants(name):
-            row = self._idx.get(variant)
-            if row:
-                def g(logical):
-                    field = self._addr_fields.get(logical, "")
-                    return row.get(field, "") if field else ""
-
-                return {
-                    "prop_address": g("prop_address"),
-                    "prop_city":    g("prop_city"),
-                    "prop_state":   "TX",
-                    "prop_zip":     g("prop_zip"),
-                    "mail_address": g("mail_address"),
-                    "mail_city":    g("mail_city"),
-                    "mail_state":   g("mail_state") or "TX",
-                    "mail_zip":     g("mail_zip"),
-                }
-
-        return {}
-
-
-# ── GHL CSV Export ────────────────────────────────────────────────────────────
+# ── GHL Export ────────────────────────────────────────────────────────────────
 
 GHL_COLS = [
-    "First Name", "Last Name",
-    "Mailing Address", "Mailing City", "Mailing State", "Mailing Zip",
-    "Property Address", "Property City", "Property State", "Property Zip",
-    "Lead Type", "Document Type", "Date Filed", "Document Number",
-    "Amount/Debt Owed", "Seller Score", "Motivated Seller Flags",
-    "Source", "Public Records URL",
+    "First Name","Last Name",
+    "Mailing Address","Mailing City","Mailing State","Mailing Zip",
+    "Property Address","Property City","Property State","Property Zip",
+    "Lead Type","Document Type","Date Filed","Document Number",
+    "Amount/Debt Owed","Seller Score","Motivated Seller Flags",
+    "Source","Public Records URL",
 ]
-
 
 def write_ghl(records, path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -608,29 +444,27 @@ def write_ghl(records, path):
             try:
                 first, last = split_name_for_ghl(r.get("owner", ""))
                 w.writerow({
-                    "First Name":            first,
-                    "Last Name":             last,
-                    "Mailing Address":       r.get("mail_address", ""),
-                    "Mailing City":          r.get("mail_city", ""),
-                    "Mailing State":         r.get("mail_state", ""),
-                    "Mailing Zip":           r.get("mail_zip", ""),
-                    "Property Address":      r.get("prop_address", ""),
-                    "Property City":         r.get("prop_city", ""),
-                    "Property State":        r.get("prop_state", ""),
-                    "Property Zip":          r.get("prop_zip", ""),
-                    "Lead Type":             r.get("cat_label", ""),
-                    "Document Type":         r.get("doc_type", ""),
-                    "Date Filed":            r.get("filed", ""),
-                    "Document Number":       r.get("doc_num", ""),
-                    "Amount/Debt Owed":      r.get("amount", ""),
-                    "Seller Score":          r.get("score", 0),
-                    "Motivated Seller Flags": "; ".join(r.get("flags", [])),
-                    "Source":                "Harris County Clerk",
-                    "Public Records URL":    r.get("clerk_url", ""),
+                    "First Name": first, "Last Name": last,
+                    "Mailing Address": r.get("mail_address",""),
+                    "Mailing City":    r.get("mail_city",""),
+                    "Mailing State":   r.get("mail_state",""),
+                    "Mailing Zip":     r.get("mail_zip",""),
+                    "Property Address": r.get("prop_address",""),
+                    "Property City":    r.get("prop_city",""),
+                    "Property State":   r.get("prop_state",""),
+                    "Property Zip":     r.get("prop_zip",""),
+                    "Lead Type":        r.get("cat_label",""),
+                    "Document Type":    r.get("doc_type",""),
+                    "Date Filed":       r.get("filed",""),
+                    "Document Number":  r.get("doc_num",""),
+                    "Amount/Debt Owed": r.get("amount",""),
+                    "Seller Score":     r.get("score",0),
+                    "Motivated Seller Flags": "; ".join(r.get("flags",[])),
+                    "Source": "Harris County Clerk",
+                    "Public Records URL": r.get("clerk_url",""),
                 })
             except Exception as e:
                 log.debug(f"GHL row error: {e}")
-
     log.info(f"GHL CSV: {path} ({len(records)} rows)")
 
 
@@ -638,7 +472,7 @@ def write_ghl(records, path):
 
 def write_output(records, df, dt):
     payload = {
-        "fetched_at":   datetime.utcnow().isoformat() + "Z",
+        "fetched_at":   datetime.utcnow().isoformat()+"Z",
         "source":       "Harris County Clerk",
         "date_range":   {"from": df.strftime("%Y-%m-%d"), "to": dt.strftime("%Y-%m-%d")},
         "total":        len(records),
@@ -657,49 +491,41 @@ async def main():
     now = datetime.utcnow()
     dt  = now
     df  = now - timedelta(days=LOOKBACK)
-    log.info(f"Harris County Scraper v9 | {df.date()} → {dt.date()}")
+    log.info(f"Harris County Scraper v10 | {df.date()} → {dt.date()}")
 
-    # Scrape
     records = await ClerkScraper(df, dt).run()
 
-    # HCAD address lookup
-    parcel = ParcelLookup()
-    loaded = parcel.load()
+    hcad   = HCADLookup()
+    loaded = hcad.load()
     if not loaded:
         log.warning("HCAD lookup unavailable — addresses will be empty")
 
-    # Enrich records
     for r in records:
         try:
             if loaded:
-                addr_data = parcel.lookup(r.get("owner", ""))
-                if addr_data:
-                    r.update(addr_data)
-            flags     = compute_flags(r, now)
-            r["flags"]  = flags
-            r["score"]  = compute_score(r, flags)
+                addr = hcad.lookup(r.get("owner", ""))
+                if addr: r.update(addr)
+            flags      = compute_flags(r, now)
+            r["flags"] = flags
+            r["score"] = compute_score(r, flags)
         except Exception as e:
             log.debug(f"Enrich error: {e}")
 
-    # Sort + deduplicate
     records.sort(key=lambda r: r.get("score", 0), reverse=True)
     seen, unique = set(), []
     for r in records:
-        k = r.get("doc_num") or (r.get("owner", "") + r.get("filed", ""))
+        k = r.get("doc_num") or (r.get("owner","") + r.get("filed",""))
         if k and k not in seen:
-            seen.add(k)
-            unique.append(r)
+            seen.add(k); unique.append(r)
     records = unique
 
-    # Write outputs
     write_output(records, df, dt)
     write_ghl(records, GHL_CSV)
 
     with_addr = sum(1 for r in records if r.get("prop_address"))
     log.info(f"Done: {len(records)} records | {with_addr} with address")
-    log.info(f"Hot (≥70): {sum(1 for r in records if r.get('score',0)>=70)}")
+    log.info(f"Hot  (≥70): {sum(1 for r in records if r.get('score',0)>=70)}")
     log.info(f"Warm (50-69): {sum(1 for r in records if 50<=r.get('score',0)<70)}")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
