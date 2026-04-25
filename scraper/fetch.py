@@ -490,38 +490,30 @@ class ClerkScraper:
             hdrs = [th.get_text(" ", strip=True).lower()
                     for th in rows[0].find_all(["th", "td"])]
             joined = " ".join(hdrs)
-
-            # Must contain at least one date-like and one name-like header.
-            # This guards against nav/layout tables being mis-parsed.
-            has_date = any(k in joined for k in ("file date", "date filed", "date"))
-            has_name = any(k in joined for k in ("names", "grantor", "grantee", "name"))
-            has_id   = any(k in joined for k in ("file number", "file no", "instrument"))
-            if not (has_date and has_name) and not has_id:
+            # Use v10 detection — broad match to avoid missing tables
+            if not any(k in joined for k in
+                       ("file number", "file date", "names", "grantor",
+                        "instrument", "grantee")):
                 continue
             if len(hdrs) < 3:
                 continue
 
             col = {}
             for i, h in enumerate(hdrs):
-                if ("file number" in h or "file no" in h or
-                        "instrument" in h) and "doc_num" not in col:
-                    col["doc_num"] = i
-                elif ("file date" in h or "date filed" in h or
-                      (h == "date" and "filed" not in col)) and "filed" not in col:
-                    col["filed"] = i
-                elif ("names" in h or "grantor" in h) and "names" not in col:
-                    col["names"] = i
-                elif "grantee" in h and "grantee" not in col:
-                    col["grantee"] = i
-                elif ("legal" in h or "description" in h) and "legal" not in col:
-                    col["legal"] = i
-                elif ("amount" in h or "consid" in h) and "amount" not in col:
-                    col["amount"] = i
+                if "file number" in h or "file no" in h:
+                    col.setdefault("doc_num", i)
+                elif "file date" in h or "date" in h:
+                    col.setdefault("filed", i)
+                elif "names" in h or "grantor" in h:
+                    col.setdefault("names", i)
+                elif "grantee" in h:
+                    col.setdefault("grantee", i)
+                elif "legal" in h or "description" in h:
+                    col.setdefault("legal", i)
+                elif "amount" in h or "consid" in h:
+                    col.setdefault("amount", i)
 
-            # If we still can't find doc_num, skip — don't accidentally treat
-            # a name column as doc_num (the v10 bug for LIEN tables).
             if "doc_num" not in col:
-                log.debug(f"[{code}] skipping table — no doc_num column in: {hdrs}")
                 continue
 
             for row in rows[1:]:
@@ -535,31 +527,16 @@ class ClerkScraper:
                             i is not None and i < len(cells)) else ""
 
                     doc_num = t("doc_num")
-                    # Sanity check: a valid doc number should not look like a name.
-                    # Harris County doc numbers are alphanumeric (e.g. RP-2026-154010).
                     if not doc_num or len(doc_num) < 2:
                         continue
-                    if re.match(r"^[A-Z][A-Z\s\-']+$", doc_num) and len(doc_num) > 6:
-                        # Looks like a name, not a doc number — skip this table
-                        log.debug(f"[{code}] doc_num looks like a name ('{doc_num}'), skipping table")
-                        break
 
                     url = ""
                     for cell in cells:
                         a = cell.find("a", href=True)
                         if a:
                             href = a["href"]
-                            if "javascript:" not in href.lower():
-                                url = href if href.startswith("http") else BASE_URL + "/" + href.lstrip("/")
-                                break
-                    # Fall back to __doPostBack URL only if nothing better found
-                    if not url:
-                        for cell in cells:
-                            a = cell.find("a", href=True)
-                            if a:
-                                href = a["href"]
-                                url = href if href.startswith("http") else BASE_URL + href
-                                break
+                            url = href if href.startswith("http") else BASE_URL + "/" + href.lstrip("/")
+                            break
                     if not url:
                         url = f"{RP_URL}?FileNum={doc_num}"
 
