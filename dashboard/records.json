@@ -1,9 +1,9 @@
 {
-  "fetched_at": "2026-05-24T09:18:37.181259Z",
+  "fetched_at": "2026-05-25T11:09:12.884695Z",
   "source": "Harris County Clerk",
   "date_range": {
-    "from": "2026-05-17",
-    "to": "2026-05-24"
+    "from": "2026-05-18",
+    "to": "2026-05-25"
   },
   "total": 4407,
   "with_address": 1064,
